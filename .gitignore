@@ -1,0 +1,34 @@
+# ---- Python 缓存与构建产物 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/work/
+build/work_launcher/
+build/launcher_dist/
+build/_version_info.generated.txt
+build/_launcher_version_info.generated.txt
+*.spec.bak
+
+# ---- 运行期用户数据（绿色版数据目录，不提交）----
+用户数据/
+导出图片/
+发布版本/
+settings.json
+secrets.json
+*.log
+
+# ---- 虚拟环境 / IDE / 工具缓存 ----
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+.pytest_cache/
+.mimosa/
+.zcode/
+
+# ---- 系统杂项 ----
+Thumbs.db
+.DS_Store
+nul

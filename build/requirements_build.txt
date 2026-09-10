@@ -1,0 +1,16 @@
+# 多通道温度分析仪 —— 构建环境依赖（仅构建机需要，Python 3.9.x）
+# 安装：python -m pip install -r build/requirements_build.txt
+#
+# 版本选择原则：
+#   - PyQt5 / Qt5：唯一仍支持 Windows 7 的官方 Qt 绑定（PyQt6 仅支持 Win10+）
+#   - 以下版本均在 Python 3.9 + Win7 上验证可用，且带有 win32 / win_amd64 轮子
+PyInstaller==5.13.2
+PyQt5==5.15.11
+matplotlib==3.5.3
+numpy==1.23.5
+pandas==1.5.3
+Pillow==9.5.0          # matplotlib.colors 运行时强制依赖；9.5 是最后一个确定带 win32 轮子且兼容 Win7 的版本
+openpyxl==3.1.5        # 读 .xlsx 所需（core.py 显式 engine="openpyxl"）
+xlrd==1.2.0            # 读 .xls 回退引擎（xlrd>=2 已不支持 xls，必须 <2）
+setuptools<81          # PyInstaller 5.13.2 的 modulegraph 依赖 pkg_resources，而 setuptools>=81 已移除该模块
+pyserial==3.5          # 串口通信（在线采集功能）

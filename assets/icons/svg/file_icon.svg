@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="fileBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#F8FAFC;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#E2E8F0;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="fileBorder" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#CBD5E1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#94A3B8;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="waveColor" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#F97316;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#FB923C;stop-opacity:1" />
+    </linearGradient>
+    <filter id="fileShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="2" dy="4" stdDeviation="4" flood-color="#000" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+  
+  <!-- 文件主体 -->
+  <path d="M 40 24 L 160 24 L 216 80 L 216 232 L 40 232 Z" 
+        fill="url(#fileBg)" 
+        stroke="url(#fileBorder)" 
+        stroke-width="2"
+        filter="url(#fileShadow)"/>
+  
+  <!-- 文件折角 -->
+  <path d="M 160 24 L 160 80 L 216 80" 
+        fill="none" 
+        stroke="#94A3B8" 
+        stroke-width="2"
+        stroke-linejoin="round"/>
+  <path d="M 160 24 L 216 80 L 160 80 Z" 
+        fill="#CBD5E1" 
+        opacity="0.5"/>
+  
+  <!-- 文件头区域 - 蓝色标签 -->
+  <rect x="56" y="112" width="144" height="8" rx="4" ry="4" fill="#2563EB" opacity="0.8"/>
+  <rect x="56" y="128" width="112" height="4" rx="2" ry="2" fill="#64748B" opacity="0.4"/>
+  
+  <!-- 温度波形图预览 -->
+  <rect x="48" y="144" width="160" height="64" rx="8" ry="8" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1"/>
+  
+  <!-- 迷你温度曲线 -->
+  <path d="M 56 180 C 72 180, 80 160, 96 160 C 112 160, 120 200, 136 200 C 152 200, 160 152, 176 152 C 192 152, 200 180, 200 180" 
+        fill="none" 
+        stroke="url(#waveColor)" 
+        stroke-width="3" 
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+  
+  <!-- 数据点 -->
+  <circle cx="96" cy="160" r="4" fill="#F97316" stroke="#FFFFFF" stroke-width="1.5"/>
+  <circle cx="136" cy="200" r="4" fill="#FB923C" stroke="#FFFFFF" stroke-width="1.5"/>
+  <circle cx="176" cy="152" r="5" fill="#EA580C" stroke="#FFFFFF" stroke-width="1.5"/>
+  
+  <!-- 时间基线 -->
+  <line x1="56" y1="204" x2="200" y2="204" stroke="#CBD5E1" stroke-width="1"/>
+  
+  <!-- 文件扩展名标识 -->
+  <rect x="56" y="216" width="48" height="12" rx="2" ry="2" fill="#2563EB" opacity="0.9"/>
+  <text x="80" y="226" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#FFFFFF">TPX</text>
+</svg>
