@@ -1,3 +1,41 @@
+# 多通道温度分析仪  (`duo-tong-dao-wen-du-fen-xi-yi`)
+
+> 多通道温度分析仪（Multi-Channel Temperature Analyzer） Windows 桌面上位机，用于多通道温度测试仪的  离线数据分析  与  串口在线采集  ： 多通道实时趋势、统计与组合图、报警…
+
+## 这是什么
+
+多通道温度分析仪（Multi-Channel Temperature Analyzer） Windows 桌面上位机，用于多通道温度测试仪的  离线数据分析  与  串口在线采集  ： 多通道实时趋势、统计与组合图、报警、历史库、PNG / Excel / A4 报告导出， 以及局域网远程访问
+
+## 技术栈与架构
+
+- **分类**：桌面应用 / 图像/视觉 / 数据处理/报表 / 硬件/通信
+- **主要语言**：Python、SQL
+- **关键依赖 / 框架**：PyQt5、matplotlib、numpy、pandas、Pillow、openpyxl、xlrd、pyserial
+
+## 目录内容（顶层）
+
+- `assets/`
+- `docs/`
+- `src/`
+- `导出图片/`
+- `用户数据/`
+
+## 规模与完整度
+
+- 完整度评分：**97%**
+- 源码文件：81 个
+- 子目录：24 个
+- 体积：22.4MB
+
+## 备注
+
+- 仓库类型：GitHub 私有仓库
+- 本文档由代码整理工具自动生成，用于快速了解仓库用途。
+
+---
+
+## 📄 项目原始说明（保留）
+
 # 多通道温度分析仪（Multi-Channel Temperature Analyzer）
 
 Windows 桌面上位机，用于多通道温度测试仪的**离线数据分析**与**串口在线采集**：
