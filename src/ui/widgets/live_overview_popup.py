@@ -222,7 +222,9 @@ class FloatingBall(QWidget):
     rightButtonClicked = pyqtSignal()     # 宠物右钮：切换迷你趋势图
     expandToggleRequested = pyqtSignal()  # 生态舱单击：切换展开模式（双面板+方向感应）
 
-    DIAMETER = 56
+    # 缺配置时的兜底球径；与 config_io.LIVE_MONITOR_DEFAULTS["ball_size"] 保持一致
+    # （2026-09-11 默认档 56→100，用户拍板）
+    DIAMETER = 100
     DRAG_THRESHOLD = 6
     # 单击响应延迟（ms）：窗口内第二次松手=双击；0=立即发单击（测试同步化）。
     # 取值不高于系统双击间隔且封顶 300ms，避免单击手感过钝。
@@ -232,12 +234,12 @@ class FloatingBall(QWidget):
     # docked/free 双态；安全矩形 A = 球心所在屏工作区 S 内缩 SAFE_INSET（桌面自由
     # 拖动：不再受宿主窗口可视区约束，跨屏按球心所在屏自动切换参考系），
     # 球面整圆恒在 A 内（拖动实时夹取，禁裁剪）；松手落在任一锚位 R_snap 内自动吸附。
-    # 锚位 = 右上/左上/右下三角 + 屏幕正中 center（默认右下角）。
+    # 锚位 = 右上/左上/右下三角 + 屏幕正中 center（2026-09-11 起默认右下角 bottom_right）。
     MODE_DOCKED = "docked"
     MODE_FREE = "free"
     CORNER_TOP_RIGHT = "top_right"
     CORNER_TOP_LEFT = "top_left"
-    CORNER_BOTTOM_RIGHT = "bottom_right"  # 右下角：贴安全矩形 A 右下边并留 CORNER_GAP
+    CORNER_BOTTOM_RIGHT = "bottom_right"
     CORNER_CENTER = "center"      # 屏幕正中：球心落在安全矩形 A（=所在屏工作区内缩区）中心
     CORNERS = (CORNER_TOP_RIGHT, CORNER_TOP_LEFT, CORNER_BOTTOM_RIGHT,
                CORNER_CENTER)
@@ -354,9 +356,9 @@ class FloatingBall(QWidget):
         self._mode = cfg.get("ball_mode", self.MODE_DOCKED)
         if self._mode not in (self.MODE_DOCKED, self.MODE_FREE):
             self._mode = self.MODE_DOCKED
-        self._corner = cfg.get("ball_corner", self.CORNER_BOTTOM_RIGHT)
+        self._corner = cfg.get("ball_corner", self.CORNER_CENTER)
         if self._corner not in self.CORNERS:
-            self._corner = self.CORNER_BOTTOM_RIGHT
+            self._corner = self.CORNER_CENTER
         self._anim = None                     # 吸附滑入动画
         # —— 球心最高温状态（Feature2：数值直显）——
         self._max_temp = None                 # float | None；None = 打盹模式
@@ -597,9 +599,9 @@ class FloatingBall(QWidget):
     def _corner_topleft(self, corner: str, rect: QRect) -> QPoint:
         """把位置锚偏好换算成球左上角。
 
-        角锚（top_left/top_right/bottom_right）贴屏幕工作区边并留 CORNER_GAP
-        边距；center 锚把球心对准 rect（安全矩形 A，=所在屏工作区内缩区）的
-        正中心，球心距 A 各边均 ≥ d/2。
+        角锚（top_left/top_right/bottom_right）贴屏幕工作区边并留 CORNER_GAP 边距；
+        center 锚把球心对准 rect（安全矩形 A，=所在屏工作区内缩区）的正中心，
+        球心距 A 各边均 ≥ d/2。
         """
         d = self._diameter
         if corner == self.CORNER_CENTER:
@@ -1253,6 +1255,7 @@ class FloatingBall(QWidget):
         act_corner_c = menu.addAction("吸附到屏幕居中")
         act_corner_tr = menu.addAction("吸附到右上角")
         act_corner_tl = menu.addAction("吸附到左上角")
+        act_corner_br = menu.addAction("吸附到右下角")
         chosen = menu.exec_(event.globalPos())
         if chosen is act_panel:
             self.panelToggleRequested.emit()
@@ -1264,6 +1267,8 @@ class FloatingBall(QWidget):
             self.bring_back_to(self.CORNER_TOP_RIGHT)
         elif chosen is act_corner_tl:
             self.bring_back_to(self.CORNER_TOP_LEFT)
+        elif chosen is act_corner_br:
+            self.bring_back_to(self.CORNER_BOTTOM_RIGHT)
         event.accept()
 
     def _panel_visible(self) -> bool:
@@ -1292,7 +1297,9 @@ class LiveOverviewPopup(QWidget):
     ANIMATE = True
     WINDOW_MIN_SEC = 5
     WINDOW_MAX_SEC = 120
-    WINDOW_DEFAULT_SEC = 30
+    # 缺配置时的兜底窗口宽；与 config_io.LIVE_MONITOR_DEFAULTS["window_sec"] 保持一致
+    # （2026-09-11 默认档 30→16，用户拍板）
+    WINDOW_DEFAULT_SEC = 16
 
     # 不透明度允许区间（0=全透明，1=完全不透明）；与配置契约同源，见 ALPHA_MIN/MAX
     ALPHA_MIN = ALPHA_MIN
@@ -1565,7 +1572,14 @@ class LiveOverviewPopup(QWidget):
         if isinstance(line, str) and (line.strip() == ""
                                       or _hex_rgb(line, None) is not None):
             self._line_color = line
-        self.set_window_sec(cfg.get("window_sec", self._window_sec_value))
+        # 窗口宽未变化时跳过 set_window_sec：其内部强制 refresh_curves(force=True)
+        # 全量重绘 matplotlib，改球径/形象等无关参数时不应背这次重绘开销
+        try:
+            window_sec = int(cfg.get("window_sec", self._window_sec_value))
+        except (TypeError, ValueError):
+            window_sec = self._window_sec_value
+        if window_sec != self._window_sec_value:
+            self.set_window_sec(window_sec)
         self.apply_theme()
 
     # ------------------------------------------------------------------

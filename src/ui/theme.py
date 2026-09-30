@@ -247,7 +247,8 @@ class Theme:
             "PLOT_FACE": "#26333c", "PLOT_GRID": "#3d5060",
             "PLOT_AXIS": "#92a6b3",
         },
-        # 浅灰工业：参考工业 HMI 控制台实机像素采样定稿。扁平浅灰——界面一块
+        # 浅灰工业：参考工业 HMI 控制台实机像素采样（2026-08-30，
+        # 移植自 feat/浅灰工业工业浅灰主题 分支终版）。扁平浅灰——界面一块
         # #e5e5e5 底（工具栏/状态栏同底一体，白底黑字按钮是唯一凸起）；
         # 正文纯黑（灰白蓝体系）；强调随全局腾讯蓝 #0052D9；趋势画布
         # 调为中性工业炭灰 #242a30（2026-09-03 用户定稿，弃偏蓝的
@@ -287,10 +288,10 @@ class Theme:
         "production_standard": ["#ff7d7d", "#b5ff64", "#ffe94a", "#61dc91", "#42d9d5", "#72abff", "#c797ff", "#ff7db7", "#afe860", "#6ed1ff"],
         "production_low_light": ["#ff7070", "#ffab3d", "#ffe34b", "#55d98a", "#35d6d4", "#66a5ff", "#c28eff", "#ff70ae", "#a8e650", "#61cbff"],
         # 浅灰工业：深画布（#212d36）配亮荧光色系，曲线在深底上清楚
-        # 醒目（与产线深色画布思路一致）
+        # 醒目（移植自 浅灰工业 分支终版，与产线深色画布思路一致）
         "grey_industrial": ["#ff5252", "#ff9100", "#ffd740", "#69f0ae", "#18ffff", "#448aff", "#b388ff", "#ff80ab", "#e040fb", "#76ff03"],
     }
-    # 浅灰工业通道色板注：中性工业炭灰画布（#242a30）与原 #212d36 亮度
+    # 浅灰工业 通道色板注：中性工业炭灰画布（#242a30）与原 #212d36 亮度
     # 相当，荧光色板对比度结论可平移（test_theme_contrast 钉死）。
 
     @classmethod
@@ -546,7 +547,7 @@ class Theme:
     def statusbar_surface(cls) -> str:
         """状态信息面板底色（用户定稿：跟随主题骨架，不抢界面层级）。
 
-        浅灰工业用炭灰与工具栏呼应（深色部件覆盖表），浅色主题用卡片底
+        浅灰工业 用炭灰与工具栏呼应（深色部件覆盖表），浅色主题用卡片底
         （黑字），产线深色主题用画布加深档（白字）。
         """
         _dp = cls._DARK_PART_OVERRIDES.get(cls._ACTIVE)
@@ -558,7 +559,7 @@ class Theme:
 
     @classmethod
     def table_face(cls):
-        """数据表深色部件面板（浅灰工业专属）；None 走各控件常规配色路径。
+        """数据表深色部件面板（浅灰工业 专属）；None 走各控件常规配色路径。
 
         返回 dict（base/alt/text/sel_bg/sel_text/header_bg/header_text），
         数据弹窗等表格/树控件据此整体换深底白字，逐单元前景补偿改用
@@ -864,7 +865,7 @@ class Theme:
             f" image: url({_close_hover}); }}"
         ) if _close else ""
 
-        # 浅灰工业专属部件 QSS 块：仅当当前主题注册了 _DARK_PART_OVERRIDES
+        # 浅灰工业 专属部件 QSS 块：仅当当前主题注册了 _DARK_PART_OVERRIDES
         # 时注入（其余主题为空串，零影响）。块置于样式表末尾——通用规则与
         # 本块同特异性时后到优先；工具栏按钮用「QToolBar#mainToolbar
         # QToolButton」后代选择器（1 id + 2 type）压过 ID 单类型规则
@@ -873,7 +874,7 @@ class Theme:
         _dark_parts = ""
         if _dp:
             _dark_parts = f"""
-        /* ── 浅灰工业部件：浅灰一体工具栏 + 白底黑字按钮 ── */
+        /* ── 浅灰工业 部件：浅灰一体工具栏 + 白底黑字按钮 ── */
         QToolBar {{
             background: {_dp['TOOLBAR_BG']};
             border-bottom: 1px solid {_dp['TOOLBAR_BORDER']};
@@ -929,7 +930,7 @@ class Theme:
         }}
         /* 状态栏浅灰一体（背景=STATUSBAR_SURFACE），文字由全局规则
            _sbar_fg 按底补偿为黑字，此处不再重复声明 */
-        /* ── 浅灰工业深色部件：数据表深灰行白字 ── */
+        /* ── 浅灰工业 深色部件：数据表深灰行白字 ── */
         QTableWidget {{
             background: {_dp['TABLE_ROW_BG']};
             color: {_dp['TABLE_ROW_TEXT']};
@@ -973,7 +974,7 @@ class Theme:
         }}
 
         /* ── 顶级综合工具栏（底色=页面主底，与左侧通道/主界面连成
-           一整块，仅靠下缘细线分区；浅灰工业深色部件块在文末覆盖） ── */
+           一整块，仅靠下缘细线分区；浅灰工业 深色部件块在文末覆盖） ── */
         QToolBar {{
             background: {_bg1};
             border: none;

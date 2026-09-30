@@ -65,8 +65,8 @@ class ChartRenderer:
     # ---- 温度轴智能判断模式：基础窗口 + 越界扩展规则 ----
     AUTO_TEMP_BASE_LO = 20.0    # 基础窗口下限（℃），数据在界内时轴固定显示
     AUTO_TEMP_BASE_HI = 40.0    # 基础窗口上限（℃）
-    AUTO_TEMP_LO_FACTOR = 0.90  # 越界扩展：最低温度 × 0.90（向下调 10%）
-    AUTO_TEMP_HI_FACTOR = 1.30  # 越界扩展：最高温度 × 1.30（向上调 30%）
+    AUTO_TEMP_LO_FACTOR = 0.90  # 越界扩展：按下界系数对最低温做方向性余量（|值|×10% 向下扩）
+    AUTO_TEMP_HI_FACTOR = 1.30  # 越界扩展：按上界系数对最高温做方向性余量（|值|×30% 向上扩）
     AUTO_TEMP_HYSTERESIS = 1.0  # 滞回阈值（℃）：越过 20-H / 40+H 才触发扩展
     AUTO_TEMP_BASE_FRAMES = 3   # 连续 N 次刷新完全回到界内，才缩回基础窗口
     AUTO_TEMP_STEP1_MAX_SPAN = 30.0  # 轴跨度 ≤ 该值时主刻度用 1℃ 递增，更大则自动 nice 步长
@@ -93,18 +93,17 @@ class ChartRenderer:
         self._live_inc = {}
         # 报警高亮：处于 active 报警的通道名集合（categorical 模式曲线变红）
         self._alarm_channels = set()
-        # 报警阈值虚线缓存：{(id(tab), pane): {"high":artist, "high_val":...}}
+        # 报警阈值虚线缓存：{(id(tab), pane): {"high":artist, "high_val":..., "label":artist}}
         # pane ∈ "single" / "dual_left" / "dual_right"（双区视图两轴各一条）
         self._alarm_lines = {}
         # 整体趋势图降采样后的 series 缓存，供鼠标悬停命中（画面实际显示的点）；
         # 键 = (id(tab), pane)，双区视图左/右轴各自缓存所在 pane 的序列
         self._overview_hover_series = {}
         # 双区视图（整体趋势页实时会话自动切换）：左=全历史 + 右=最近实时窗。
-        # 默认 True（批 6 恢复）：旧断言已按双区语义同批修订（见
-        # test_live_view_interaction 各用例 diff 注释）；关闭开关
-        # （set_dual_view_config(False, W) / settings.json dual_view_enabled）
-        # 仍可回退单图路径。
-        self.dual_view_enabled = True
+        # 2026-09-11 默认改不启动（用户拍板，与 LIVE_MONITOR/轴设置默认对齐）；
+        # 开关（set_dual_view_config(True, W) / settings.json dual_view_enabled）
+        # 仍可启用双区路径。
+        self.dual_view_enabled = False
         self.live_window_sec = float(LIVE_WINDOW_SEC_DEFAULT)
         # 上次渲染所见布局记录：id(tab) -> tab.layout_mode。
         # 布局切换时 PlotTab.clear() 会重建坐标轴，旧 artist / 阈值线 /
@@ -117,6 +116,11 @@ class ChartRenderer:
         self.live_view_mode = "auto"   # auto=全局趋势跟随(0~最新)；manual=手动浏览
         self.live_max_points = self.DEFAULT_LIVE_MAX_POINTS
         self._manual_xlim = None
+        # 手动浏览冻结的温度轴范围：框选缩放设置了 Y，但刷新链只回填 X，
+        # Y 被温度轴状态机在下一帧弹回（框选放大"只生效一半"）。与 X 同
+        # 生命周期：进手动记录、回 auto / 回到最新 / 会话切换 / 显式调
+        # 温度轴基础窗口时清除。
+        self._manual_ylim = None
         self._drag_state = None
         self._drag_dual = False
         self._box_zoom = None
@@ -212,9 +216,11 @@ class ChartRenderer:
         self._dual_left_xlim = None
 
     def _draw_alarm_thresholds(self, tab, pane="single"):
-        """在趋势图上画报警上限虚线（报警启用时）。
+        """在趋势图上画报警上限虚线 + 文字标注（报警启用时）。
 
         下限已于 2026-08-22 移除（业务决策：报警只保留上限）。
+        标注文案注明“基础窗口”（P1-5 F2）：报警上限只跟随用户显式设定的
+        基础窗口，图表轴自动扩展不改变报警上限，消除“跟随显示轴”误解。
         全量重建后缓存失效（由 _plot_multi 在 tab.clear() 后 pop 缓存）；
         增量路径下检测阈值是否变化，未变则跳过、变化则更新。
         报警关闭时移除已有虚线。dual 双区视图对左右两轴各画一条，
@@ -223,33 +229,41 @@ class ChartRenderer:
         ax = self._pane_axis(tab, pane)
         cfg = getattr(self.mw, "alarm_config", None)
         cache = self._alarm_lines.get((id(tab), pane))
+
+        def _discard(cache):
+            for artist in (cache.get("high"), cache.get("label")):
+                try:
+                    if artist is not None and getattr(artist, "axes", None) is ax:
+                        artist.remove()
+                except Exception as e:
+                    print(f"[CHART] 报警线清理异常: {e}", flush=True)
+
         if cfg is None or not cfg.enabled:
             if cache:
-                for ln in (cache.get("high"),):
-                    try:
-                        if ln is not None and getattr(ln, "axes", None) is ax:
-                            ln.remove()
-                    except Exception as e:
-                        print(f"[CHART] 报警线清理异常: {e}", flush=True)
+                _discard(cache)
                 self._alarm_lines.pop((id(tab), pane), None)
             return
         hi = cfg.temp_high
         # 阈值未变且 artist 仍存活 → 跳过
         if (cache and cache.get("high_val") == hi
                 and cache.get("high") is not None
+                and cache.get("label") is not None
                 and getattr(cache["high"], "axes", None) is ax):
             return
         if cache:
-            for ln in (cache.get("high"),):
-                try:
-                    if ln is not None and getattr(ln, "axes", None) is ax:
-                        ln.remove()
-                except Exception as e:
-                    print(f"[CHART] 绘制线清理异常: {e}", flush=True)
+            _discard(cache)
         hline = ax.axhline(hi, color=Theme.plot_alarm_color(), linestyle="--",
                            linewidth=1.0, alpha=0.55, zorder=1,
                            gid="alarm_bound")
-        self._alarm_lines[(id(tab), pane)] = {"high": hline, "high_val": hi}
+        label = ax.text(
+            0.99, hi, f"报警上限 {hi:g}℃（基础窗口）",
+            transform=ax.get_yaxis_transform(),
+            ha="right", va="bottom",
+            fontsize=Theme.PLOT_TICK_SIZE,
+            color=Theme.plot_alarm_color(), alpha=0.85, zorder=2,
+            gid="alarm_bound_text")
+        self._alarm_lines[(id(tab), pane)] = {
+            "high": hline, "high_val": hi, "label": label}
 
     def _pane_axis(self, tab, pane):
         """按 pane 角色返回对应坐标轴（single/dual_left=左主轴，dual_right=右辅轴）。"""
@@ -346,19 +360,38 @@ class ChartRenderer:
         t_all = (np.asarray(buf.time, dtype=float)
                  if buf is not None else np.array([]))
         lookup = getattr(session, "channel_by_label", None)
+        processed = getattr(session, "processed", None)
         for pos, name in enumerate(names):
             ch = lookup(name) if callable(lookup) else None
             idx = getattr(ch, "index", None)
             if ch is None or idx is None or t_all.size == 0:
                 continue
-            # 原始值：buffer 时间轴（秒）按最近时间戳取该通道列
+            # 原始值：按最近时间戳取该通道原始列。时间基准与查找轴都取
+            # 处理后 t（与渲染 x 同源）：时间重标定/重采样开启时处理后 t[0]
+            # 可能不等于原始 t[0]，仍按原始基准换算会整体错位、悬停卡片
+            # 显示错误时刻的温度。重标定样本一一对应 → 直接按处理后时间
+            # 取下标；重采样长度不同 → 回退在原始时间轴上找最近时刻。
             if 0 <= int(idx) < buf.n_channels:
+                col = np.asarray(buf.column(int(idx)), dtype=float)
+                origin = float(t_all[0])
+                t_lookup = t_all
+                if isinstance(processed, dict):
+                    try:
+                        proc = processed.get(int(idx))
+                        pt = (np.asarray(proc[0], dtype=float)
+                              if proc is not None and len(proc) else
+                              np.array([]))
+                        if pt.size:
+                            origin = float(pt[0])
+                            if pt.size == t_all.size:
+                                t_lookup = pt
+                    except (IndexError, TypeError, ValueError,
+                            OverflowError):
+                        pass
                 i = self._nearest_time_index(
-                    t_all, float(t_all[0]) + float(target_x_min) * 60.0)
-                if i is not None:
-                    col = np.asarray(buf.column(int(idx)), dtype=float)
-                    if i < col.size and np.isfinite(col[i]):
-                        rows[pos] = (name, float(col[i]), rows[pos][2])
+                    t_lookup, origin + float(target_x_min) * 60.0)
+                if i is not None and i < col.size and np.isfinite(col[i]):
+                    rows[pos] = (name, float(col[i]), rows[pos][2])
         return rows
 
     @staticmethod
@@ -471,10 +504,43 @@ class ChartRenderer:
         self._refresh_for_hover_focus()
 
     def _refresh_for_hover_focus(self):
-        """锁定焦点变更后立即重绘曲线，避免只更新左侧卡片。"""
-        refresh = getattr(self.mw, "refresh_plots", None)
-        if callable(refresh):
-            refresh()
+        """锁定焦点变更后立即更新曲线强调，避免只更新左侧卡片。"""
+        self.refresh_hover_emphasis()
+
+    def refresh_hover_emphasis(self):
+        """焦点（锁定/卡片悬停）变化后的轻量曲线强调更新（FA-PERF-4）。
+
+        对增量缓存里的 artist 原位改线宽/透明度/层级（O(通道数)），
+        替代旧路径「焦点编入增量键 → 键失效 → 整图重建」——长会话多
+        通道下悬停每次进出都重建全部曲线是肉眼可见的卡顿源。焦点是
+        全局状态（锁定 > 卡片悬停），对全部 pane 统一生效；无可用
+        增量缓存（离线会话不走路增量路径）时回退整页渲染保持旧语义。
+        """
+        focus = self._effective_hover_channel(getattr(self.mw, "tab_all", None))
+        applied = False
+        # 最小构造渲染器（无 _live_inc，既有测试契约）视为无可原位更新项
+        live_inc = getattr(self, "_live_inc", None) or {}
+        for (_tab_id, _pane), inc in live_inc.items():
+            for name, artist in inc["artists"]:
+                try:
+                    style = self.line_style(name, focus)
+                    artist.set_linewidth(style["linewidth"])
+                    artist.set_alpha(style["alpha"])
+                    artist.set_zorder(style["zorder"])
+                    applied = True
+                except (AttributeError, ValueError, TypeError):
+                    continue
+        if not applied:
+            refresh = getattr(self.mw, "refresh_plots", None)
+            if callable(refresh):
+                refresh()
+                return
+        for tab in (getattr(self.mw, n, None)
+                    for n in ("tab_all", "tab_10", "tab_20", "tab_30")):
+            # 最小构造替身的 Tab 可能无 canvas（既有测试契约），跳过即可
+            canvas = getattr(tab, "canvas", None) if tab is not None else None
+            if canvas is not None:
+                canvas.draw_idle()
 
     def _effective_hover_channel(self, tab, transient_name=None):
         """返回统一视觉焦点：点击锁定 > 左侧卡片悬停 > 图表临时命中。"""
@@ -898,6 +964,17 @@ class ChartRenderer:
         count_label = getattr(self.mw, "lbl_point_count", None)
         if count_label is not None:
             count_text = self._session_count_text(session)
+            # P1-4 持久化度量顺带展示（不改布局）：录制中在点数同一显示位
+            # 追加 未入库/兜底 行数，spill>0 即写库曾连续失败需人工留意
+            if store.recorder.is_active:
+                extra = []
+                if store.pending_rows:
+                    extra.append(f"未入库 {store.pending_rows}")
+                if store.spill_rows:
+                    extra.append(f"兜底 {store.spill_rows}")
+                if extra:
+                    count_text = (count_text + "｜" if count_text else "") \
+                        + "｜".join(extra)
             count_label.setText(count_text)
         elapsed_label = getattr(self.mw, "lbl_elapsed", None)
         if elapsed_label is not None:
@@ -966,7 +1043,14 @@ class ChartRenderer:
         return np.isfinite(values) & (np.abs(values) <= 1.0e12)
 
     def _latest_live_minute(self, session):
-        """返回实际可见实时曲线中最新的有效采样时间（分钟）。"""
+        """返回实际可见实时曲线中最新的有效采样时间（分钟）。
+
+        取每通道末位有效样本（最近一次采样）而非全量 max：主机时钟
+        回拨会使时间数组非单调，max 停在回拨前峰值、状态栏"最新"误导。
+        刻意经 visible_series（处理后时间轴，与渲染同源）取数——重标定/
+        重采样开启时状态范围与画面一致（既有契约）；配合 visible_series
+        记忆化（FA-PERF-1）本方法每帧为缓存命中 + O(通道数) 尾部读取。
+        """
         channel_panel = getattr(self.mw, "channel_panel", None)
         visible_series = getattr(channel_panel, "visible_series", None)
         if callable(visible_series):
@@ -980,7 +1064,7 @@ class ChartRenderer:
                     time_min = np.asarray(item[1], dtype=float)
                     valid = self._valid_live_time_mask(time_min)
                     if valid.any():
-                        current = float(time_min[valid].max())
+                        current = float(time_min[valid][-1])
                         latest_min = (current if latest_min is None
                                       else max(latest_min, current))
                 except (IndexError, TypeError, ValueError, OverflowError):
@@ -992,7 +1076,7 @@ class ChartRenderer:
             valid = self._valid_live_time_mask(time_sec)
             if not valid.any():
                 return None
-            latest_min = float(time_sec[valid].max()) / 60.0
+            latest_min = float(time_sec[valid][-1]) / 60.0
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None
         return latest_min if np.isfinite(latest_min) else None
@@ -1098,6 +1182,7 @@ class ChartRenderer:
         self.live_view_mode = mode
         if mode != "manual":
             self._manual_xlim = None
+            self._manual_ylim = None
             self._auto_return_timer.stop()
             # 模式切换退出暂停跟随：暂停冻结只属于 auto 双区态，manual 走
             # 单图路径且定时器已停，不清会让切回 auto 后永久冻结
@@ -1156,11 +1241,17 @@ class ChartRenderer:
         self.return_to_latest()
 
     def _enter_manual_view(self, ax):
-        """进入手动浏览：实时/离线数据都记录手动横轴范围，暂停自动跟随。"""
+        """进入手动浏览：实时/离线数据都记录手动横轴范围，暂停自动跟随。
+
+        Y 范围一并记录：框选缩放会显式设置 ylim，滚轮/平移进入时记录
+        当前自适应 ylim——手动模式下 X/Y 语义一致（视图冻结，实时会话
+        2 分钟无操作自动回最新，「回到最新」恢复）。
+        """
         if self.mw.dataset is None:
             return
         self.live_view_mode = "manual"
         self._manual_xlim = tuple(float(v) for v in ax.get_xlim())
+        self._manual_ylim = tuple(float(v) for v in ax.get_ylim())
         sync_mode = getattr(self.mw, "_sync_live_view_actions", None)
         if sync_mode is not None:
             sync_mode("manual")
@@ -1235,6 +1326,8 @@ class ChartRenderer:
                         state["press_candidate"] = candidate
             # 左键拖拽：平移视图（dual 激活时为左区浏览窗平移）
             self._drag_dual = self._dual_pane_active()
+            if event.xdata is None:
+                return
             self._drag_state = (float(event.xdata), ax.get_xlim())
         elif event.button == 3:
             # 右键拖拽：框选缩放（拖出矩形区域放大查看细节）
@@ -1311,17 +1404,21 @@ class ChartRenderer:
             if event.inaxes is self.mw.tab_all.ax:
                 self._on_overview_mouse_move(event)
 
-    def _prepare_live_series(self, series):
+    def _prepare_live_series(self, series, restrict_manual=True):
         """按当前视图模式截取并抽样，原始 series 不做修改。
 
         离线数据在自动（全量）模式下保持原始曲线；进入手动浏览时
         与实时数据一致，只截取手动范围对应的数据用于轴自适应。
+        restrict_manual=False 时不套用手动窗口（前N分钟/对比等非整体
+        趋势页）：手动浏览范围只属于整体趋势页，泄漏到其它标签会把
+        「前N分钟」页截成手动窗切片、图文不符，且离线会话无 2 分钟
+        自动回最新，永不自愈。
         """
         if not self.mw.dataset:
             return series
         mode = self._normalized_live_view_mode()
         manual_range = (self._manual_display_range()
-                        if mode == "manual" else None)
+                        if mode == "manual" and restrict_manual else None)
         # 离线大数据同样降采样到 live_max_points（仅显示层，保留局部极值；
         # 原始数据 / 统计 / 导出不受影响），避免全量 matplotlib 绘制卡顿。
         out = []
@@ -1381,6 +1478,8 @@ class ChartRenderer:
         """
         self._auto_temp_state = "base"
         self._auto_temp_in_base_frames = 0
+        # 显式调温度轴 = 解除手动浏览的 Y 冻结，本次起按新基础窗口自适应
+        self._manual_ylim = None
 
     def refresh_axis_only(self) -> None:
         """仅按当前基础窗口重算可见标签页的温度轴范围，不重建任何曲线。
@@ -1479,7 +1578,8 @@ class ChartRenderer:
         elif idx == self.mw.idx_combo:
             self._plot_combo()
         elif idx == self.mw.idx_stat:
-            self.mw._update_stats()
+            # 统计重算全量 O(n)：走主窗统一节流入口，禁止按帧直调（整改 Q2-1）
+            self.mw._request_stats_update()
         self.update_live_status_labels()
         sync_controls = getattr(self.mw, "_update_live_view_controls", None)
         if callable(sync_controls):
@@ -1677,14 +1777,35 @@ class ChartRenderer:
 
     # --------------------------------------------------------------- 轴设置应用
 
-    def _auto_temp_axis(self, dmin, dmax):
+    @staticmethod
+    def _expand_lo(v, factor):
+        """方向性下界扩展：正温与 v×factor 等价；负/零温按 |v| 余量继续向下扩。
+
+        纯乘法 `v × factor(factor≤1)` 对负值会把下界算到 v 上方（-10→-9），
+        轴包不住数据导致曲线底部被裁切（P1-5 F1 修复）；改为
+        `v − |v|×(1−factor)` 后正温行为不变、负温方向正确。
+        """
+        return v - abs(v) * max(0.0, 1.0 - factor)
+
+    @staticmethod
+    def _expand_hi(v, factor):
+        """方向性上界扩展：正温与 v×factor 等价；负温向 0 方向（上方）扩。"""
+        return v + abs(v) * max(0.0, factor - 1.0)
+
+    def _auto_temp_axis(self, dmin, dmax, wmin=None, wmax=None):
         """温度轴智能判断模式的自适应范围（状态机）。
 
         基础窗口与扩展系数从配置读取（主界面左侧底部调基础窗口，设置页调系数）：
           - 基础窗口（默认 [20, 40]）：数据在界内（含滞回阈值）时轴固定不变；
-          - 越界后按「最低温度 × 下界系数 / 最高温度 × 上界系数」扩展，实时只扩不缩；
-          - 数据完全回到基础窗口且连续 AUTO_TEMP_BASE_FRAMES 次刷新后，
+          - 越界后按方向性余量扩展（下界 |min|×(1−lo 系数)、上界 |max|×(hi 系数−1)，
+            见 _expand_lo/_expand_hi），实时只扩不缩；
+          - 判定数据完全回到基础窗口且连续 AUTO_TEMP_BASE_FRAMES 次刷新后，
             才缩回基础窗口，避免临界值附近反复跳变。
+        wmin/wmax 为最近 live_window_sec 实时窗的 min/max（P1-5 F3-B）：
+        实时采集下状态机判定改用近窗数据——整体趋势页输入是全历史，
+        历史尖峰会让回缩永不成立、并让缩回后立即再扩展（一次尖峰永久拉伸）；
+        采用近窗判定后历史峰允许出画（被裁切，数据不丢）。传 None
+        （离线/无实时数据）时回退 dmin/dmax，行为与旧版一致。
         状态仅启动时初始化一次，不随新会话 / 新文件 / 通道显隐变化重置。
         """
         base_lo = float(self.mw.ax_temp_base_lo)
@@ -1692,21 +1813,23 @@ class ChartRenderer:
         lo_factor = float(self.mw.ax_temp_lo_factor)
         hi_factor = float(self.mw.ax_temp_hi_factor)
         hys = self.AUTO_TEMP_HYSTERESIS
+        jmin = dmin if wmin is None else float(wmin)
+        jmax = dmax if wmax is None else float(wmax)
         if self._auto_temp_state == "base":
-            if dmin >= base_lo - hys and dmax <= base_hi + hys:
-                # 数据仍在基础窗口（含滞回余量）内 → 轴保持不动
+            if jmin >= base_lo - hys and jmax <= base_hi + hys:
+                # 判定数据仍在基础窗口（含滞回余量）内 → 轴保持不动
                 self._auto_temp_in_base_frames = 0
                 self._auto_temp_range = (base_lo, base_hi)
             else:
-                # 真正越界 → 切到扩展，按温度本身的比例扩展
+                # 真正越界 → 切到扩展，按方向性余量扩展
                 self._auto_temp_state = "expanded"
                 self._auto_temp_in_base_frames = 0
                 self._auto_temp_range = (
-                    min(base_lo, dmin * lo_factor),
-                    max(base_hi, dmax * hi_factor))
+                    min(base_lo, self._expand_lo(jmin, lo_factor)),
+                    max(base_hi, self._expand_hi(jmax, hi_factor)))
         else:  # expanded
-            if dmin >= base_lo and dmax <= base_hi:
-                # 数据完全回到基础窗口 → 连续计数，满 N 次才缩回
+            if jmin >= base_lo and jmax <= base_hi:
+                # 判定数据完全回到基础窗口 → 连续计数，满 N 次才缩回
                 self._auto_temp_in_base_frames += 1
                 if self._auto_temp_in_base_frames >= self.AUTO_TEMP_BASE_FRAMES:
                     self._auto_temp_state = "base"
@@ -1717,16 +1840,18 @@ class ChartRenderer:
                 self._auto_temp_in_base_frames = 0
                 cur_lo, cur_hi = self._auto_temp_range
                 self._auto_temp_range = (
-                    min(cur_lo, dmin * lo_factor),
-                    max(cur_hi, dmax * hi_factor))
+                    min(cur_lo, self._expand_lo(jmin, lo_factor)),
+                    max(cur_hi, self._expand_hi(jmax, hi_factor)))
         return self._auto_temp_range
 
     def _apply_axis(self, ax, xs, ys):
         """按“轴设置”页配置约束横轴/纵轴范围与主刻度。原 MainWindow._apply_axis
 
         实时采集模式（活跃会话为 live）下，智能判断时采用全局趋势跟随：
-          - 时间轴：固定从 0（采集开始）开始，右边界 = 最新点 + 30% 余量，
-            随采集实时推进，整条趋势曲线始终完整可见；
+          - 时间轴：采集进行中固定从 0（采集开始）开始，右边界 = 最新点 +
+            30% 余量，随采集实时推进；已停止（stopped_at 非空）则右界冻结
+            在最新点，不再保留实时余量（与双区 _dual_pane_apply_axes 的
+            停止语义对齐）；左界兜底覆盖主机时钟回拨产生的负时段；
           - 温度轴：统一智能模式，按「基础窗口（配置可调）+ 越界扩展」状态机
             自适应（见 _auto_temp_axis），避免温度小幅波动导致整图跳变。
         """
@@ -1751,12 +1876,61 @@ class ChartRenderer:
                 step = _nice_step(span, target_ticks=6)
                 top = math.ceil(xmax / step) * step
                 if getattr(s, "is_live", False):
-                    # 实时全局趋势：横轴固定从 0 开始，右边界 = 最新点 + 30% 余量
-                    xmin = 0.0
-                    top = max(top, xmax + max(xmax, 1.0) * 0.3)
+                    # 左界覆盖数据（含时钟回拨负时段，保证可见可回看）
+                    xmin = min(0.0, xmin)
+                    if getattr(s, "stopped_at", None) is None:
+                        # 采集进行中：右边界 = 最新点 + 30% 余量
+                        top = max(top, xmax + max(xmax, 1.0) * 0.3)
                 ax.set_xlim(xmin, top)
         # 温度轴统一智能模式：基础窗口 + 越界扩展（见 _auto_temp_axis）
         self._apply_temp_axis(ax, ys)
+
+    def _live_window_bounds(self):
+        """最近 live_window_sec 秒实时数据的 (min, max)，供状态机近窗判定（F3-B）。
+
+        非实时会话 / 无可见通道数据 / 取数异常时返回 (None, None)，
+        状态机自动回退全量 min/max（离线语义不变）。时间轴为分钟
+        （相对会话起点），与 dual 双区右窗切分同源。
+        """
+        s = getattr(self.mw, "dataset", None)
+        if s is None or not getattr(s, "is_live", False):
+            return None, None
+        panel = getattr(self.mw, "channel_panel", None)
+        if panel is None:
+            return None, None
+        try:
+            raw = panel.visible_series(None)
+        except Exception as e:
+            print(f"[CHART] 近窗判定取数异常: {e}", flush=True)
+            return None, None
+        cleaned = []
+        t_end = None
+        for _name, x, v in raw:
+            x = np.asarray(x, dtype=float)
+            v = np.asarray(v, dtype=float)
+            count = min(x.size, v.size)
+            x, v = x[:count], v[:count]
+            m = self._valid_live_time_mask(x)
+            x, v = x[m], v[m]
+            if not x.size:
+                continue
+            cleaned.append((x, v))
+            end = float(x.max())
+            t_end = end if t_end is None else max(t_end, end)
+        if t_end is None:
+            return None, None
+        split = max(0.0, t_end - float(self.live_window_sec) / 60.0)
+        wmin = wmax = None
+        for x, v in cleaned:
+            vf = v[(x >= split) & np.isfinite(v)]
+            if not vf.size:
+                continue
+            lo, hi = float(vf.min()), float(vf.max())
+            wmin = lo if wmin is None else min(wmin, lo)
+            wmax = hi if wmax is None else max(wmax, hi)
+        if wmin is None or wmax is None:
+            return None, None
+        return wmin, wmax
 
     def _temp_axis_range(self, ys):
         """温度轴状态机 + nice 取整，返回 (bot, top, step)；无有效值返回 None。
@@ -1764,6 +1938,7 @@ class ChartRenderer:
         注意 _auto_temp_axis 状态机每次调用推进一帧（回缩计数、只扩不缩）
         ——dual 双区等一次刷新只允许调用一次本方法，结果同步应用到多个轴
         （见 _apply_shared_temp_axis），否则状态机会被双倍推进。
+        实时会话下附加近窗判定输入（F3-B，见 _live_window_bounds）。
         """
         yf = ys[np.isfinite(ys)]
         if not yf.size:
@@ -1772,7 +1947,12 @@ class ChartRenderer:
         ymax = float(yf.max())
         if ymin >= ymax:
             ymax = ymin + 1.0
-        bot, top = self._auto_temp_axis(ymin, ymax)
+        try:
+            wmin, wmax = self._live_window_bounds()
+        except Exception as e:
+            print(f"[CHART] 近窗判定异常（回退全量）: {e}", flush=True)
+            wmin = wmax = None
+        bot, top = self._auto_temp_axis(ymin, ymax, wmin, wmax)
         span = top - bot
         # 小范围尽量用 1℃ 递增（25、26…），范围过大再自动取 nice 步长
         step = (1.0 if span <= self.AUTO_TEMP_STEP1_MAX_SPAN
@@ -1830,7 +2010,9 @@ class ChartRenderer:
                         if live_mode == "manual" else None)
         self._clear_overview_hover(tab, draw=False)
         series = self.mw.channel_panel.visible_series(max_minutes) if self.mw.dataset else []
-        series = self._prepare_live_series(series)
+        # 手动窗口只作用于整体趋势页（restrict_manual），其余标签恒全量
+        series = self._prepare_live_series(
+            series, restrict_manual=tab is overview_tab)
         # 整体趋势图缓存降采样后的 series，供鼠标悬停命中（画面实际显示的点）
         if tab is overview_tab:
             self._overview_hover_series[(id(tab), "single")] = series
@@ -1839,6 +2021,8 @@ class ChartRenderer:
             if (tab is overview_tab
                     and live_mode == "manual" and manual_range is not None):
                 tab.ax.set_xlim(*manual_range)
+                if self._manual_ylim is not None:
+                    tab.ax.set_ylim(*self._manual_ylim)
             if (tab is overview_tab
                     and getattr(self.mw.dataset, "is_live", False)
                     and last_event is not None and last_event.inaxes is tab.ax):
@@ -1860,6 +2044,8 @@ class ChartRenderer:
         if (tab is overview_tab
                 and live_mode == "manual" and manual_range is not None):
             ax.set_xlim(*manual_range)
+            if self._manual_ylim is not None:
+                ax.set_ylim(*self._manual_ylim)
         tab.canvas.draw_idle()
         if (tab is overview_tab
                 and getattr(self.mw.dataset, "is_live", False)
@@ -2263,6 +2449,9 @@ class ChartRenderer:
         强制全量重绘，曲线颜色随新方案更新；实时追加数据时指纹不变，
         照常走 set_data 增量。pane 角色与 live_window_sec 加入指纹：
         双区布局切换或右窗宽度调整后旧 artist 必须全量重建。
+        焦点（锁定/悬停）不进键（FA-PERF-4）：悬停切换经
+        refresh_hover_emphasis 原位改线宽/透明度（O(通道数)），不再
+        借键失效整图重建；数据帧内由 _try_incremental 顺带重放焦点样式。
         """
         cfg = store.config
         pal = tuple(cfg.palette or []) if cfg is not None else ()
@@ -2270,14 +2459,8 @@ class ChartRenderer:
             str(self.mw.channel_panel.color_of(name)).lower()
             for name, _, _ in series
         )
-        overview_tab = getattr(self.mw, "tab_all", None)
-        hovered = (self._effective_hover_channel(overview_tab)
-                   if overview_tab is not None
-                   else getattr(self.mw.channel_panel,
-                                "_hover_channel_name", None))
         return (self.mw.color_mode, tuple(name for name, _, _ in series),
                 (cfg.color_mode if cfg is not None else "", pal), colors,
-                hovered,
                 pane, self.live_window_sec)
 
     def _try_incremental(self, tab, series, pane="single", apply_axis=True):
@@ -2316,6 +2499,18 @@ class ChartRenderer:
                     else self.mw.channel_panel.color_of(name))
             xs_all.append(x)
             ys_all.append(v)
+        # 焦点强调原位重放（FA-PERF-4）：焦点已不进增量键，帧内顺带把
+        # 当前锁定/悬停焦点的线宽/透明度/层级同步到复用 artist 上
+        focus = self._effective_hover_channel(
+            getattr(self.mw, "tab_all", None))
+        for name, artist in cached["artists"]:
+            try:
+                style = self.line_style(name, focus)
+                artist.set_linewidth(style["linewidth"])
+                artist.set_alpha(style["alpha"])
+                artist.set_zorder(style["zorder"])
+            except (AttributeError, ValueError, TypeError):
+                continue
         if xs_all:
             xs = np.concatenate(xs_all)
             ys = np.concatenate(ys_all)

@@ -101,7 +101,8 @@ class AcquisitionProtocol:
         """计算 CRC16（Modbus 多项式 0xA001），按协议行为实现，实测帧校验结果一致。
 
         返回标准 16 位 CRC 值（未交换字节序）。发送帧与接收响应一律按
-        [高字节, 低字节] 顺序传输（实测真机确认，与本模块 _frame 构建序一致）。
+        [高字节, 低字节] 顺序传输（实测真机确认，
+        _frame 构建序一致）。
         """
         crc = 0xFFFF
         for byte in data:
@@ -136,6 +137,22 @@ class AcquisitionProtocol:
         expected_low = data_with_crc[-1]   # CRC 低字节（传输在后）
         computed = AcquisitionProtocol.calc_crc16(payload)
         return expected_high == (computed >> 8) & 0xFF and expected_low == computed & 0xFF
+
+    @staticmethod
+    def check_header_crc(frame: bytes) -> bool:
+        """校验新协议响应帧头 CRC（整改 N-4）。
+
+        响应帧 [TPID + CMD + headerCRC(2B) + ...]，headerCRC 覆盖 TPID+CMD。
+        该字段此前从未校验，字节序无真机裁决证据（发送序为高字节在前，
+        接收帧头序未经核对）：暂接受任一字节序以杜绝坏帧伪造，两序均
+        不匹配即拒绝；真机确认单一序后可收紧（协议存疑，真机裁决）。
+        """
+        if len(frame) < 4:
+            return False
+        computed = AcquisitionProtocol.calc_crc16(frame[0:2])
+        hi, lo = (computed >> 8) & 0xFF, computed & 0xFF
+        return (frame[2] == hi and frame[3] == lo) or \
+               (frame[2] == lo and frame[3] == hi)
 
     @staticmethod
     def build_connect_command() -> bytes:
@@ -208,7 +225,7 @@ class AcquisitionProtocol:
 
     @staticmethod
     def build_set_chanonoff_command(channel_masks: list[int]) -> bytes:
-        """设置通道开关 (0x18)：发送 9 字节通道掩码。"""
+        """设置通道开关 (0x18): 发送 9 字节掩码。"""
         masks = list(channel_masks[:9]) + [0x00] * (9 - len(channel_masks))
         return AcquisitionProtocol._frame(SET_CHANONOFF, bytes(masks[:9]))
 
@@ -505,11 +522,20 @@ class SerialPortManager:
     # 单次读超时（秒）。2400 波特下 22 字节响应约需 92ms，但设备内部
     # 存储/处理可能偶发延迟，0.5s 过短会误报"无响应"，取 1.0s 更稳。
     DEFAULT_TIMEOUT = 1.0
+    # 单次写超时（秒，整改 N-2）：pyserial 3.5 Windows 后端 write_timeout=None
+    # 时 write() 走 GetOverlappedResult(bWait=True) 无界等待（已读钉版安装源
+    # serialwin32.py 实证）；采集轮询每轮都在工作线程发送指令帧，设备流控
+    # 异常/USB 驱动挂起会永久挂死采集线程。禁止传 0（0=MAXDWORD 异步语义）。
+    DEFAULT_WRITE_TIMEOUT = 1.0
+    # 单次 send_and_receive 事务总时限（秒，整改 N-2）：写/读各自有限后
+    # 兜底整事务，防止重试次数或超时参数放大总耗时。
+    TRANSACTION_BUDGET_SEC = 6.0
 
     def __init__(self):
         self._port = None        # serial.Serial 实例
         self._serial = None      # serial 模块引用
         self._available = True   # pyserial 是否可用
+        self._last_config = None  # 最近一次成功打开的 (port, baud)，N-3 重连用
 
         try:
             import serial as _serial_mod
@@ -611,12 +637,19 @@ class SerialPortManager:
 
     # --- 打开/关闭 ---
 
-    def open(self, port_name: str, baudrate: int = DEFAULT_BAUDRATE) -> bool:
+    def open(self, port_name: str, baudrate: int = DEFAULT_BAUDRATE,
+             write_timeout: Optional[float] = DEFAULT_WRITE_TIMEOUT) -> bool:
         """打开串口，配置为 8N1。
 
         Args:
             port_name: COM 口名称，如 "COM3"
             baudrate:  波特率，默认 2400
+            write_timeout: 单次写超时（秒）。默认 1.0（整改 N-2）：
+                pyserial 3.5 Windows 后端 write_timeout=None 时
+                GetOverlappedResult(bWait=True) 为**无上限阻塞**，采集轮询
+                每轮都发送指令帧，写挂起即挂死采集线程。同步写场景（如报警
+                线圈后台线程）同样必须给有限值；仅显式传 None 才恢复无界
+                语义，禁止传 0（0=MAXDWORD 异步旁路，非"立即返回"）。
 
         Returns:
             bool: 打开成功返回 True
@@ -634,11 +667,23 @@ class SerialPortManager:
                 parity=self.DEFAULT_PARITY,
                 stopbits=self.DEFAULT_STOPBITS,
                 timeout=self.DEFAULT_TIMEOUT,
+                write_timeout=write_timeout,
             )
+            self._last_config = (port_name, int(baudrate))
             return True
         except Exception:
             self._port = None
             return False
+
+    def reopen(self) -> bool:
+        """按最近一次成功打开的参数重开口（整改 N-3：采集线程重连窗用）。
+
+        仅由采集工作线程在重连阶段调用；从未成功打开过时返回 False。
+        """
+        if not self._last_config:
+            return False
+        port_name, baudrate = self._last_config
+        return self.open(port_name, baudrate)
 
     def close(self):
         """关闭串口。"""
@@ -737,6 +782,10 @@ class SerialPortManager:
 
         Returns:
             Optional[bytes]: 成功返回响应数据；设备 NAK 返回错误帧；失败返回 None
+
+        整改 N-2：整事务受 TRANSACTION_BUDGET_SEC 总时限约束——每次读超时取
+        剩余预算与 DEFAULT_TIMEOUT 的较小值，预算耗尽立即停止重试返回 None，
+        防止写超时/读超时/重试次数放大后单事务耗时失控。
         """
         if len(data) < 2:
             return None
@@ -744,14 +793,19 @@ class SerialPortManager:
         if not self.is_open:
             return None
         result = None
+        deadline = time.monotonic() + self.TRANSACTION_BUDGET_SEC
         for _ in range(retries):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
                 self._port.reset_input_buffer()
             except Exception:
                 pass
             if not self.write(data):
                 continue
-            resp = self.read(resp_len)
+            resp = self.read(resp_len,
+                             timeout=min(remaining, self.DEFAULT_TIMEOUT))
             if resp and len(resp) >= resp_len:
                 # 帧头匹配校验（TPID + CMD 回显）
                 if resp[0] == data[0] and resp[1] == expected_cmd:
@@ -805,8 +859,14 @@ class AcquisitionWorker(QtCore.QThread):
     DEFAULT_INTERVAL_MS = 1000
     # 默认重试间隔（秒）
     RETRY_INTERVAL_SEC = 2.0
-    # 最大连续错误次数后主动断开
+    # 最大连续错误次数后进入重连窗（整改 N-3：不再直接终结会话）
     MAX_CONSECUTIVE_ERRORS = 5
+    # 重连窗时长（秒）：进入后每 RETRY_INTERVAL_SEC 试轮询/重开口，
+    # 窗口耗尽仍未恢复才发一次 connection_changed(False) 终结会话
+    RECONNECT_WINDOW_SEC = 30.0
+    # 整改 N-4：新协议帧头 CRC / 旧协议和校验的无真机一手向量口径，
+    # 连续 N 帧「数据区校验通过但该校验不过」即降级为仅告警（自愈护栏）
+    STRICT_CRC_DISABLE_AFTER = 3
 
     def __init__(self, serial_mgr: SerialPortManager,
                  protocol: AcquisitionProtocol | None = None,
@@ -815,6 +875,7 @@ class AcquisitionWorker(QtCore.QThread):
                  active_groups: int | None = None,
                  proto_mode: str = "auto",
                  instrument_type: int = 0,
+                 frame_sink=None,
                  parent: QtCore.QObject | None = None):
         """
         Args:
@@ -826,6 +887,9 @@ class AcquisitionWorker(QtCore.QThread):
                          读取完整帧但只上报前 active_groups*8 个通道（后台"采集组数"设置）。
             proto_mode:  协议模式 "auto"(自动握手) / "new"(直接新协议) / "old"(直接旧协议)
             instrument_type: 旧协议设备类型（0=TP-1, 1=TP-2），仅 proto_mode="old" 时用
+            frame_sink:  持久化回调 callable(timestamp, values)，在本采集线程内
+                         同步执行（整改计划 P1-1：落库投递先于 Qt 信号，
+                         GUI 冻结时数据仍持续入库）；异常不中断采集。
             parent:      QObject 父对象
         """
         super().__init__(parent)
@@ -833,6 +897,7 @@ class AcquisitionWorker(QtCore.QThread):
         self._protocol = protocol or AcquisitionProtocol()
         self._interval_ms = max(100, interval_ms)  # 最小 100ms
         self._group_count = group_count
+        self._frame_sink = frame_sink
         # 实际启用的通道组数（后台"采集组数"设置），默认与设备配置组数一致
         if active_groups is not None and 0 < active_groups < group_count:
             self._active_groups = int(active_groups)
@@ -846,6 +911,15 @@ class AcquisitionWorker(QtCore.QThread):
 
         # 错误计数
         self._error_count = 0
+        # N-3 重连窗状态
+        self._reconnecting = False
+        self._reconnect_deadline = 0.0
+        self._conn_lost_reported = False
+        # N-4 帧头 CRC / 旧和校验的自愈降级状态
+        self._hdr_bad_streak = 0
+        self._hdr_crc_disabled = False
+        self._chk_bad_streak = 0
+        self._checksum_disabled = False
 
         # 协议模式（构造时传入，避免重复握手）
         self._proto_mode = proto_mode  # "auto" / "new" / "old"
@@ -914,7 +988,7 @@ class AcquisitionWorker(QtCore.QThread):
           2. 每 _interval_ms 执行一次采集
           3. 按检测到的协议读温度
           4. emit data_received(timestamp, values)
-          5. 连续错误超限自动断开
+          5. 连续错误超限进入有限重连窗（整改 N-3），窗口耗尽才断开
         """
         self._running = True
         self._error_count = 0
@@ -951,11 +1025,17 @@ class AcquisitionWorker(QtCore.QThread):
 
         while self._running:
             if self._paused:
+                # 暂停挂起重连窗计时：暂停时长不计入 30s 尝试预算
+                if self._reconnecting:
+                    self._reconnect_deadline += 0.2
                 time.sleep(0.2)
                 continue
 
             if not self._serial_mgr.is_open:
-                time.sleep(self.RETRY_INTERVAL_SEC)
+                # 整改 N-3：此前串口死亡在此无限静默轮转、UI 卡在采集中；
+                # 与读失败断线同走有限重连窗
+                if not self._handle_conn_loss():
+                    break
                 continue
 
             # 按协议模式读取温度
@@ -966,15 +1046,22 @@ class AcquisitionWorker(QtCore.QThread):
 
             if values is None:
                 self._error_count += 1
+                if self._error_count >= self.MAX_CONSECUTIVE_ERRORS:
+                    # 进入/维持重连窗；窗口耗尽返回 False 终结会话
+                    if not self._handle_conn_loss():
+                        break
+                    continue
                 self.error_occurred.emit(
                     f"读取数据失败 ({self._error_count}/{self.MAX_CONSECUTIVE_ERRORS})"
                 )
-                if self._error_count >= self.MAX_CONSECUTIVE_ERRORS:
-                    self.connection_changed.emit(False)
                 time.sleep(self.RETRY_INTERVAL_SEC)
                 continue
 
-            # 成功：清除错误计数
+            # 成功：退出重连窗并清除错误计数
+            if self._reconnecting:
+                self._reconnecting = False
+                self._conn_lost_reported = False
+                print("[ACQ] 重连成功，恢复采集", flush=True)
             if self._error_count > 0:
                 self._error_count = 0
                 self.connection_changed.emit(True)
@@ -984,11 +1071,55 @@ class AcquisitionWorker(QtCore.QThread):
                 values = values[:self._active_channels]
 
             timestamp = time.time()
-            # 发射数据：timestamp, values（用于数据库写入）
+            # P1-1：先在采集线程投递持久化（Recorder 内存缓冲，微秒级），
+            # 再发 Qt 信号给 UI——GUI 冻结/卡死期间数据仍持续落库。
+            # sink 异常只记日志，绝不中断采集与界面刷新。
+            if self._frame_sink is not None:
+                try:
+                    self._frame_sink(timestamp, values)
+                except Exception as e:
+                    print(f"[ACQ] 持久化投递失败（不影响采集）: {e}", flush=True)
+            # 发射数据：timestamp, values（UI 展示链：内存 buffer/报警判定/心跳）
             self.data_received.emit(timestamp, values)
             time.sleep(self._interval_ms / 1000.0)
 
         self._running = False
+
+    def _handle_conn_loss(self) -> bool:
+        """整改 N-3：有限重连窗。返回 True 继续轮询；False 表示窗口耗尽。
+
+        - 首次进入发一条断线提示并开 RECONNECT_WINDOW_SEC 截止；
+        - 每轮发一帧全 None 占位帧（缺口在库中记为 is_valid=0 行），
+          串口已死则按上次参数 reopen() 重试；
+        - connection_changed(False) 只在窗口耗尽时发一次（一次性闩锁），
+          杜绝旧实现中过阈值后每个失败帧重复 emit。
+        """
+        now = time.monotonic()
+        if not self._reconnecting:
+            self._reconnecting = True
+            self._reconnect_deadline = now + self.RECONNECT_WINDOW_SEC
+            self.error_occurred.emit(
+                f"设备连接断开，{int(self.RECONNECT_WINDOW_SEC)} 秒内自动尝试重连")
+        # P1 整合：占位帧与正常帧一样在采集线程投递持久化（GUI 链路已不落库），
+        # 断线缺口由 Recorder 按 is_valid=0 行记录（保持 N-3 契约）。
+        placeholder_ts = time.time()
+        placeholder = [None] * self._active_channels
+        if self._frame_sink is not None:
+            try:
+                self._frame_sink(placeholder_ts, placeholder)
+            except Exception as e:
+                print(f"[ACQ] 持久化投递失败（不影响采集）: {e}", flush=True)
+        self.data_received.emit(placeholder_ts, placeholder)
+        if not self._serial_mgr.is_open:
+            self._serial_mgr.reopen()
+        time.sleep(self.RETRY_INTERVAL_SEC)
+        if time.monotonic() < self._reconnect_deadline:
+            return True
+        if not self._conn_lost_reported:
+            self._conn_lost_reported = True
+            self.error_occurred.emit("重连窗口耗尽，结束采集会话")
+            self.connection_changed.emit(False)
+        return False
 
     def _read_new(self):
         """新协议读温度（READ_ALL_CH 0x13 + CRC16）。
@@ -1006,13 +1137,36 @@ class AcquisitionWorker(QtCore.QThread):
         if resp[0] != TPID or resp[1] != READ_ALL_CH:
             print(f"[ACQ] 读温失败: 帧头不匹配 {resp[0]:02x}/{resp[1]:02x} (期望 85/13)", flush=True)
             return None
-        # 校验尾部 CRC（只覆盖温度数据部分）。校验失败仅记录警告、不中断
-        # 采集：防御性处理——CRC 失配时温度字段本身仍可用。
+        # 整改 N-4：尾部 CRC 覆盖温度数据区，失败一律整帧拒绝——随机字节
+        # 不再可能被解析成任意温度进统计/报警（真机口径自字节序整改后已验证）。
         temp_data = resp[4:4 + self._group_count * 16 + CRC_LEN]
         if not self._protocol.check_crc16(temp_data):
             tail = temp_data[-2:].hex() if len(temp_data) >= 2 else ""
-            print(f"[ACQ] 读温警告: 尾部 CRC 未通过 (尾部={tail})，继续解析",
+            print(f"[ACQ] 读温失败: 尾部 CRC 未通过 (尾部={tail})，整帧拒绝",
                   flush=True)
+            return None
+        # 整改 N-4：帧头 CRC 从未校验。但设备侧口径/字节序无真机一手向量
+        # （现有真机向量均为「尾 CRC」短帧），硬拒有误伤真机的风险：
+        # 尾 CRC 已过而帧头 CRC 连续 STRICT_CRC_DISABLE_AFTER 帧不过 →
+        # 判定本实现口径与设备不符，自动降级为仅告警（真机裁决项）。
+        if not self._protocol.check_header_crc(resp):
+            if self._hdr_crc_disabled:
+                print("[ACQ] 读温警告: 帧头 CRC 未通过（口径已降级，仅告警）",
+                      flush=True)
+            else:
+                self._hdr_bad_streak += 1
+                if self._hdr_bad_streak < self.STRICT_CRC_DISABLE_AFTER:
+                    print(f"[ACQ] 读温失败: 帧头 CRC 未通过 (帧头={resp[:4].hex()})，"
+                          f"整帧拒绝 ({self._hdr_bad_streak}/"
+                          f"{self.STRICT_CRC_DISABLE_AFTER})", flush=True)
+                    return None
+                self._hdr_crc_disabled = True
+                self.error_occurred.emit(
+                    "帧头CRC连续不过而尾部CRC正常——设备帧头CRC口径与本实现不符，"
+                    "已降级为仅告警（真机裁决项）")
+                print("[ACQ] 帧头 CRC 校验降级为仅告警", flush=True)
+        else:
+            self._hdr_bad_streak = 0
         values = self._protocol.parse_temperature(resp, self._group_count)
         if values and not any(v is not None for v in values):
             # 全部无效 → 打印特殊值分布，便于诊断设备通道使能 / 热电偶状态
@@ -1041,6 +1195,28 @@ class AcquisitionWorker(QtCore.QThread):
             return None
         if resp[0] != TPID or resp[1] != READ_ALL_CH_OLD:
             return None
+        # 整改 N-4：旧协议和校验（verify_checksum_old 按协议文档 X3 覆盖
+        # 冷端+温度区）定义后一直零调用——坏帧同样能出数。校验失败拒绝出数；
+        # 与帧头 CRC 同理，设备固件若按其他范围求和会连续不过 → 降级仅告警。
+        if not self._protocol.verify_checksum_old(resp):
+            if self._checksum_disabled:
+                print("[ACQ] 旧协议读温警告: 和校验未通过（口径已降级，仅告警）",
+                      flush=True)
+            else:
+                self._chk_bad_streak += 1
+                if self._chk_bad_streak < self.STRICT_CRC_DISABLE_AFTER:
+                    print(f"[ACQ] 旧协议读温失败: 和校验未通过 "
+                          f"(校验字节={resp[-1]:02x})，整帧拒绝 "
+                          f"({self._chk_bad_streak}/{self.STRICT_CRC_DISABLE_AFTER})",
+                          flush=True)
+                    return None
+                self._checksum_disabled = True
+                self.error_occurred.emit(
+                    "旧协议和校验连续不过——设备校验口径与本实现不符，"
+                    "已降级为仅告警（真机裁决项）")
+                print("[ACQ] 旧协议和校验降级为仅告警", flush=True)
+        else:
+            self._chk_bad_streak = 0
         cold, temps = self._protocol.parse_temperature_old(resp, self._instrument_type)
         return temps
 

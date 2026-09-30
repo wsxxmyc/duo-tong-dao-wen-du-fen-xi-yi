@@ -9,7 +9,8 @@ DataStore —— 全局唯一的数据总线。
 它同时解决了重构的四个目标：
 
 1. 统一数据层     —— 通道列表 / 名称 / 自定义只有 Session + ChannelConfig 一份
-2. 实时追加写入   —— append_live() 同时写内存 buffer 和磁盘 Recorder
+2. 实时追加写入   —— 采集线程 persist_frame() 投递持久化（Recorder 缓冲），
+                    GUI 线程 append_live() 写内存 buffer 并广播 UI
 3. 所有页面同源   —— 一个 data_appended 信号，所有页面同步刷新
 4. 配置全局共享   —— 文件导入与在线采集走同一个 ChannelConfig
 
@@ -23,9 +24,11 @@ sessions 是有序字典，可同时存在：
 
 线程模型
 --------
-AcquisitionWorker 在子线程发 data_received 信号，
-Qt 队列连接自动派发到主线程的 append_live 槽，
-因此 buffer 的写入始终在主线程，无需加锁。
+采集子线程每帧先经 persist_frame()（线程安全，只入 Recorder 内存缓冲，
+微秒级，不做 I/O、不发 Qt 信号）完成持久化投递；随后 data_received
+经 Qt 队列连接派发到主线程的 append_live 槽，写内存 buffer 并广播 UI。
+落库提交由 Recorder 专职 flusher 线程按秒级间隔执行——GUI 冻结/卡死
+不影响数据逐秒入库（整改计划 P1）。
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal
 
 from .channel_config import load_or_migrate
 from .session import Session, SOURCE_FILE
@@ -68,14 +71,14 @@ class DataStore(QObject):
 
     def __init__(self, config_dir: str = "",
                  history_db: Optional["HistoryDatabase"] = None,
-                 db_write_interval: float = 60.0):
+                 db_write_interval: float = 1.0):
         """
         初始化数据总线
 
         参数:
             config_dir: 配置目录路径
             history_db: 数据库管理器实例（可选）
-            db_write_interval: 数据库批量写入间隔（秒）
+            db_write_interval: 数据库批量写入间隔（秒），默认 1 秒
         """
         super().__init__()
         self._sessions: "OrderedDict[str, Session]" = OrderedDict()
@@ -89,11 +92,6 @@ class DataStore(QObject):
         )
         self._recorded_rows = 0
         self._history_db = history_db
-
-        # 数据库定时刷新定时器
-        self._db_flush_timer = QTimer(self)
-        self._db_flush_timer.timeout.connect(self._flush_db_timer)
-        self._db_flush_timer.setInterval(int(db_write_interval * 1000))
 
         if config_dir:
             self.init_config(config_dir)
@@ -113,21 +111,16 @@ class DataStore(QObject):
             self.config.apply_all(s.channels)
         self.channels_changed.emit(keys)
 
-    def _flush_db_timer(self):
-        """定时刷新数据库缓冲区（由定时器调用）"""
-        if self.recorder:
-            self.recorder.flush_db()
+    def set_storage_config(self, db_flush_sec: float) -> None:
+        """更新数据库落库间隔（秒），运行时生效。
 
-    def set_storage_config(self, db_write_interval_minutes: float) -> None:
-        """更新数据库批量写入间隔（分钟），运行时生效。
-
-        仅数据库存储：写入模式固定，批量写入间隔由主窗口初始化时固定同步。
+        钳制分两层：本入口经 Recorder 属性 setter 下限钳 0.2 秒；
+        启动/热重载读配置路径（主窗口 _load_storage_config）另按
+        storage.db_flush_sec 钳 [0.5, 300]。
+        仅数据库存储：写入模式固定，落库间隔由主窗口初始化时固定同步。
         调用方：主窗口加载配置后。
         """
-        if self.recorder:
-            self.recorder.db_write_interval = float(db_write_interval_minutes) * 60.0  # 分钟→秒
-        self._db_flush_timer.setInterval(
-            int(float(db_write_interval_minutes) * 60.0 * 1000))
+        self.recorder.db_write_interval = float(db_flush_sec)
 
     # ==================================================================
     #  会话访问
@@ -151,6 +144,22 @@ class DataStore(QObject):
     def has_live(self) -> bool:
         """是否存在实时采集会话"""
         return bool(self._live_id) and self._live_id in self._sessions
+
+    # ── P1-4 持久化度量（供状态栏/诊断只读展示）──
+    @property
+    def pending_rows(self) -> int:
+        """内存缓冲中尚未落库的采集行数。"""
+        return self.recorder.pending_rows
+
+    @property
+    def spill_rows(self) -> int:
+        """本会话已旁路写入兜底文件的行数（>0 表示写库发生过连续失败）。"""
+        return self.recorder.spill_rows
+
+    @property
+    def last_flush_age_sec(self) -> float:
+        """距最近一次成功落库的秒数（从未成功为 -1）。"""
+        return self.recorder.last_flush_age_sec
 
     def get(self, session_id: str) -> Session | None:
         """按会话 ID 查找会话（不存在返回 None）"""
@@ -417,16 +426,30 @@ class DataStore(QObject):
             rec.pop("name", None)
         self.config.save()
 
-    def append_live(self, t: float, values, timestamp: float | None = None) -> int:
-        """采集线程数据入口（Qt 队列连接 → 在主线程执行）。
+    def persist_frame(self, timestamp: float, values) -> bool:
+        """持久化入口：由采集工作线程直接调用（不经 GUI 事件循环）。
 
-        一次调用完成三件事：写内存 buffer、写磁盘、广播增量信号。
-        所有页面都通过 data_appended 收到通知，无论当前显示哪一页。
+        只做一次加锁入队（Recorder 内存缓冲），不发任何 Qt 信号、
+        不做任何 I/O；提交由 Recorder flusher 线程按秒级间隔完成。
+        GUI 冻结/卡死/崩溃不影响本路径——这是"采集数据逐秒落库"的底线。
 
         参数:
-            t: 相对时间（秒）
-            values: 各通道数值列表
-            timestamp: 绝对时间戳（可选，用于数据库写入）
+            timestamp: 帧绝对时间戳（秒）
+            values: 各通道数值列表（None → 无效）
+        """
+        s = self.live
+        if s is None or not s.is_recording:
+            return False
+        if not self.recorder.is_active:
+            return False
+        return self.recorder.write_frame(0.0, values, timestamp=timestamp)
+
+    def append_live(self, t: float, values, timestamp: float | None = None) -> int:
+        """UI 线程数据入口（Qt 队列连接 data_received → 主线程执行）。
+
+        自 P1 起只负责：写内存 buffer（绘图数据源）+ 广播增量信号。
+        持久化已前移到采集线程的 persist_frame()，此处不再写 Recorder，
+        避免同一帧双写。timestamp 参数保留仅为接口兼容。
         """
         s = self.live
         if s is None:
@@ -434,12 +457,6 @@ class DataStore(QObject):
         if len(values) > len(s.channels):
             s.ensure_channels(len(values), self.config)
         row = s.append_frame(t, values)
-
-        if self.recorder.is_active and s.is_recording:
-            # 传递时间戳给 Recorder（用于数据库写入）
-            self.recorder.write_frame(t, values, timestamp=timestamp)
-            self._recorded_rows += 1
-
         self.data_appended.emit(s.id, row, 1)
         return row
 
@@ -493,7 +510,7 @@ class DataStore(QObject):
     # ==================================================================
     def start_recording(self, session_id: str = "",
                         session_name: Optional[str] = None) -> bool:
-        """开始数据库录制：初始化数据库会话并启动刷新定时器。
+        """开始数据库录制：初始化数据库会话并启动专职 flusher 线程。
 
         参数:
             session_id: 数据库会话 ID（可选，默认使用实时会话 ID）
@@ -522,22 +539,18 @@ class DataStore(QObject):
             s.started_at = time.time()
         s.is_recording = True
 
-        # 启动数据库刷新定时器
-        self._db_flush_timer.start()
-
         self.recording_changed.emit(True, "")
         return True
 
     def stop_recording(self, export_tpx_path: str | None = None) -> bool:
         """停止录制：提交剩余数据、写入会话停止时间。可另存一份原厂 .tpx。"""
-        # 停止数据库刷新定时器
-        if self._db_flush_timer.isActive():
-            self._db_flush_timer.stop()
-
         s = self.live
+        if s is not None:
+            # 先摘除采集线程持久化路径（persist_frame 判据），再关录制器，
+            # 避免 close 排空后又有新帧入缓冲
+            s.is_recording = False
         self.recorder.close()
         if s is not None:
-            s.is_recording = False
             s.stopped_at = time.time()
             if export_tpx_path:
                 ok, err = write_tpx(export_tpx_path, s)
@@ -570,11 +583,7 @@ class DataStore(QObject):
 
     # ==================================================================
     def shutdown(self) -> None:
-        """退出前收尾：确保落盘完整。"""
-        # 停止定时器
-        if self._db_flush_timer.isActive():
-            self._db_flush_timer.stop()
-
+        """退出前收尾：确保落盘完整（Recorder.close 同步排空 + spill 兜底）。"""
         # 关闭录制器（提交剩余数据库缓冲区并写入会话停止时间）
         if self.recorder.is_active:
             self.recorder.close()

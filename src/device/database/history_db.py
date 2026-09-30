@@ -116,8 +116,10 @@ class HistoryDatabase:
         try:
             # 启用 WAL 模式
             self.conn.execute('PRAGMA journal_mode=WAL')
-            # 降低同步频率（NORMAL 比 FULL 快，但安全性略低）
-            self.conn.execute('PRAGMA synchronous=NORMAL')
+            # FULL：每次 commit 强制 fsync WAL——断电/系统崩溃后已提交批次
+            # 必然在库（P1 落库间隔收紧到 1 秒/批，提交频率高但每批很小，
+            # 用吞吐换"已采集数据不丢"的底线保证）
+            self.conn.execute('PRAGMA synchronous=FULL')
             # 增大缓存（10000 页，约 40MB）
             self.conn.execute('PRAGMA cache_size=10000')
             # 临时表存内存

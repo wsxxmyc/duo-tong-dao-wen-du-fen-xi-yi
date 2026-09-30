@@ -64,6 +64,10 @@ class Pipeline:
         if params:
             self.params.update(params)
         self._dirty = True
+        # 参数代数：set_params 实质变化时递增，供上层取数缓存
+        # （ChannelPanel.visible_series 记忆化）识别"行数未变但结果
+        # 已变"的失效场景（改平滑/重采样参数后不得返回旧数组）
+        self.version = 0
 
     # ==================================================================
     def set_params(self, params: dict) -> bool:
@@ -75,6 +79,7 @@ class Pipeline:
                 changed = True
         if changed:
             self._dirty = True
+            self.version += 1
         return changed
 
     @property

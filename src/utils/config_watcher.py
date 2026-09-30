@@ -8,6 +8,7 @@ ConfigWatcher —— settings.json 运行时热重载。
 
 对外信号：
 - section_changed(set[str])  —— 发生变化的一级配置段名。
+- names_file_changed()       —— 通道名称独立文件被外部修改（去抖 + 哈希判重）。
 
 无 Qt 依赖的用法：仅需 PyQt5.QtCore，可安全被 GUI 主线程持有。
 """
@@ -17,6 +18,7 @@ import os
 
 from PyQt5.QtCore import QFileSystemWatcher, QObject, QTimer, pyqtSignal
 
+from . import channel_names_file
 from .config_io import ConfigIO, SETTINGS_FILE
 
 
@@ -24,6 +26,7 @@ class ConfigWatcher(QObject):
     """监听配置文件的运行时变化，去抖后发出 section_changed 信号。"""
 
     section_changed = pyqtSignal(set)
+    names_file_changed = pyqtSignal()
 
     DEBOUNCE_MS = 400   # 文件系统事件聚合窗口
 
@@ -47,7 +50,7 @@ class ConfigWatcher(QObject):
         应在应用完成启动配置加载后再调用，避免重复应用一遍已有配置。
         """
         if paths is None:
-            paths = (SETTINGS_FILE,)
+            paths = (SETTINGS_FILE, channel_names_file.NAMES_FILE)
         self._paths = [p for p in paths if os.path.exists(p)]
         if self._paths:
             self._watcher.addPaths(self._paths)
@@ -89,6 +92,12 @@ class ConfigWatcher(QObject):
                 for k in set(self._loaded) - set(new):
                     changed.add(k)
             self._loaded = new
+        # 通道名称独立文件：内容哈希与最近一次自身写入不一致 → 外部修改
+        names_path = channel_names_file.NAMES_FILE
+        if names_path in paths:
+            if channel_names_file.file_hash(names_path) != \
+                    channel_names_file.written_hash():
+                self.names_file_changed.emit()
         if changed:
             self.section_changed.emit(changed)
 

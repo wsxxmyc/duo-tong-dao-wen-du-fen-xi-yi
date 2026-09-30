@@ -8,6 +8,9 @@ loader —— 文件 → Session。
 已在 core.py 中经多组样本与 .xls↔.tpx 交叉验证（8374 格 100% 一致），
 重写风险远大于收益。这里只做 `core.Dataset → Session` 的适配。
 
+待 P8 阶段把纯算法搬进 algo/ 时，再把解析函数原样迁移过来，
+届时本文件的对外签名不变，上层无感知。
+
 关键点：文本文件用表头中的物理通道号生成 Session 稳定键；TPX
 二进制的数据区按启用顺序存储，样本中可能把第 8 个组内通道写成
 `CH64`，因此 TPX 必须使用解析器生成的组内顺序名 `CH1..CH8`。
@@ -26,7 +29,6 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:  # 仅类型标注用，避免运行时循环导入
     from .channel_config import ChannelConfig
 
-# 以 src 为根目录导入同级 utils 包中的 core
 from utils import core
 
 

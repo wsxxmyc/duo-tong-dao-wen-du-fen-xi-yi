@@ -8,6 +8,7 @@ main_window.py — 主窗口纯编排器
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from dataclasses import replace as _dc_replace
 from typing import Optional
@@ -95,10 +96,11 @@ class PortComboBox(QComboBox):
 from utils import core
 from ui.theme import Theme
 from utils.config_io import ConfigIO, LIVE_WINDOW_SEC_DEFAULT
+from utils import channel_names_file
 from utils.export import ExportManager, _EXPORT_THEME_NOT_SET
 from utils.helpers import FONT_PRESETS, FONT_LEVEL_NAMES, _build_font_dict, _fmt_win_int
 from utils.alarm_sound import start_alarm_loop, stop_alarm_loop, alarm_loop_active
-from utils.modbus_rtu import build_write_single_coil
+from utils.alarm_side_effects import AlarmSideEffects
 from ui.dialogs.export_dialog import ExportDialog
 
 from device.datastore import store
@@ -137,6 +139,9 @@ from ui.widgets.heartbeat_indicator import (STATE_CONNECTING, STATE_OFF,
 
 CONFIG_DIR = ConfigIO._resolve_config_dir() if hasattr(ConfigIO, '_resolve_config_dir') else \
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+
+# 单帧 GUI 槽耗时护栏阈值（P0-4）：超过即计数 + 状态栏告警，为卡死留证据
+SLOW_SLOT_WARN_SEC = 0.5
 
 
 # ── 内置配色方案（通道管理页勾选切换）──────────────────────────────
@@ -200,6 +205,44 @@ class _BackgroundWorker(QThread):
         except Exception as e:
             import traceback
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
+class _OldDbImportWorker(QThread):
+    """后台逐库迁移旧版本数据库：import_external_sessions 串行合并进本机库。
+
+    C1：大库逐会话复制耗时，移出 UI 线程；进度（库序号/总数/路径）经
+    信号回 UI 线程状态栏。abort() 只在库与库之间生效（单库合并不中断，
+    中途强退最多留下「部分库已合并」，下次启动重扫按会话去重续迁）。
+    """
+    progress = pyqtSignal(int, int, str)   # 第几个库(1起), 库总数, 库路径
+    done = pyqtSignal(object)              # [(db_path, imported, skipped, failed), ...]
+    failed = pyqtSignal(str)
+
+    def __init__(self, hdb, db_paths, parent=None):
+        super().__init__(parent)
+        self._hdb = hdb
+        self._paths = list(db_paths)
+        self._abort = False
+
+    def abort(self):
+        """请求在当前库合并完成后停止剩余库（线程安全，仅置标记）。"""
+        self._abort = True
+
+    def run(self):
+        results = []
+        try:
+            for i, path in enumerate(self._paths, 1):
+                if self._abort:
+                    break
+                self.progress.emit(i, len(self._paths), path)
+                imported, skipped, failed = \
+                    self._hdb.import_external_sessions(path)
+                results.append((path, imported, skipped, failed))
+        except Exception as e:
+            self.failed.emit(
+                f"{e}\n（出错前已完成 {len(results)}/{len(self._paths)} 个库）")
+            return
+        self.done.emit(results)
 
 
 class _RemoteLoadWorker(QThread):
@@ -496,8 +539,8 @@ class MainWindow(QMainWindow):
         self._last_local_ip = "127.0.0.1"  # 本机 IP 缓存（服务管理器创建时刷新）
         # 窗口标题基础文案（不含 TCP 网络信息段）；各业务场景经
         # _set_window_title 更新，TCP 段随服务启停自动拼接/移除
-        self._title_base = "多通道温度分析仪"
-        self._db_write_interval = 1.0  # 数据库批量写入间隔（分钟），默认 1 分钟
+        self._title_base = "温度爬升分析工具"
+        self._db_write_interval = 1.0  # 数据库落库间隔（秒），逐秒持久化底线（P1）
         # 客户端模式标志：已从远程设备加载数据即为「客户端模式」。
         # 服务端模式（网络服务运行中）与客户端模式硬互斥，横幅经
         # 「数据」弹窗服务页 set_client_active 同步
@@ -521,7 +564,8 @@ class MainWindow(QMainWindow):
         self.ax_temp_lo_factor = 0.90  # 下界扩展系数（越界时 × 最低温度）
         self.ax_temp_hi_factor = 1.30  # 上界扩展系数（越界时 × 最高温度）
         # 整体趋势双区视图：开关 + 右区实时窗宽度（秒）；
-        # 由 load_axis_config 从 settings.json 读取覆盖（缺键回默认）
+        # 由 load_axis_config 从 settings.json 读取覆盖（缺键回默认）。
+        # 2026-09-11 默认改不启动双区图（用户拍板）。
         self.ax_dual_view_enabled = False
         self.ax_live_window_sec = LIVE_WINDOW_SEC_DEFAULT
 
@@ -535,14 +579,21 @@ class MainWindow(QMainWindow):
 
         # ── 温度报警参数（仅实时采集判定，详见 core.AlarmConfig）──
         self.alarm_config = core.AlarmConfig()
-        # 报警判定状态机：{(channel_idx|None, alarm_type): "normal"|"active"}
+        # 报警判定状态机：{(channel_idx|None, alarm_type):
+        #   "normal"|"active"|("clearing", ts)}（core.alarm_phase 解析）
         # channel_idx 为 None 表示帧级报警（通道间温差）
         self._alarm_states = {}
         # 各通道上一有效点 {channel_idx: (timestamp, value)}，供变化率判定
         self._alarm_prev = {}
-        # Modbus 报警输出串口（独立于采集串口，零侵入采集线程）
-        self._alarm_serial = None
+        # 报警副作用后台执行器（P0-3）：DB 事件写 + Modbus 线圈输出
+        # 全部移出 GUI 线程，只投递不等待；生命周期随采集启停
+        self._alarm_fx = AlarmSideEffects(
+            db_provider=lambda: getattr(self, "_history_db", None),
+            cfg_provider=lambda: self.alarm_config)
+        # 线圈目标电平边沿标志（GUI 侧仅去重投递，实际写由后台合并）
         self._alarm_serial_on = False
+        # P0-4 单帧槽耗时护栏计数（>SLOW_SLOT_WARN_SEC 的帧数）
+        self._slow_slot_count = 0
         # 报警确认标记：复位（确认静音）后 active 的 (ch,type) 加入此集合，
         # 不再响声 / 弹窗，直到温度恢复（cleared）移除后再次超限才重新提醒
         self._alarm_acked = set()
@@ -711,6 +762,8 @@ class MainWindow(QMainWindow):
             self._config_watcher = ConfigWatcher(self)
             self._config_watcher.section_changed.connect(
                 self._on_config_file_changed)
+            self._config_watcher.names_file_changed.connect(
+                self._on_names_file_changed)
             self._config_watcher.start()
         except Exception as exc:
             print(f"[ConfigWatcher] 初始化失败：{exc}", flush=True)
@@ -867,12 +920,16 @@ class MainWindow(QMainWindow):
             # 会话切换后不沿用旧会话的手动横轴范围，避免状态串到新会话。
             renderer.live_view_mode = "auto"
             renderer._manual_xlim = None
+            renderer._manual_ylim = None
             # 双区暂停冻结点 / 左区浏览窗引用旧会话时间轴，一并清空，
             # 避免新会话错误冻结在旧切分点（不重渲染，下方统一重绘）
             renderer.reset_dual_view_state()
             # 增量/报警线缓存一并失效：新会话强制全量重建，避免复用旧 artist
             renderer._live_inc.clear()
             renderer._alarm_lines.clear()
+            # 报警高亮集合按显示名匹配，不随会话切换清理会把仍在报警的
+            # 旧会话通道红色染到新会话同名通道（如 CH1）上
+            renderer._alarm_channels.clear()
         if session is None:
             # 会话关闭 → 通道面板清空显示空提示
             self.channel_panel.populate()
@@ -890,7 +947,7 @@ class MainWindow(QMainWindow):
         self._loading = False
         self._refresh_single_combo()
         self.refresh_plots()
-        self._update_stats()
+        self._request_stats_update(force=True)
         self._update_source_label()
         # 更新会话切换条选中态
         self._update_session_tab_selection()
@@ -1043,17 +1100,26 @@ class MainWindow(QMainWindow):
         self._pet_style = cfg.get("pet_style", "dino")
         self._cabin_fluct_rate = float(cfg.get("cabin_fluct_rate", 2.0))
         self._cabin_highs = dict(cfg.get("cabin_channel_highs", {}))
-        if popup is not None:
-            popup.set_appearance(cfg)
+        # 球先应用（纯 Qt 属性，轻且无外部依赖）；弹窗后应用并容错——
+        # 弹窗 set_appearance 携带 matplotlib 重绘，真机弹窗展开时一旦异常
+        # 不得阻断形象切换/球径等基础项（切形象「不实时生效」的根因加固）
         if ball is not None:
             ball.set_pet_style(self._pet_style)
-            ball.set_diameter(cfg.get("ball_size", 56))
+            ball.set_diameter(cfg.get("ball_size", 100))
             ball.set_ball_alpha(cfg.get("ball_alpha", 1.0))
             if cfg.get("ball_corner") in ball.CORNERS:
                 ball.apply_corner_pref(cfg["ball_corner"])
             if not self._lm_ball_show_max:
                 ball.clear_max_temp()
                 self._cabin_clear_push(ball)
+        if popup is not None:
+            try:
+                popup.set_appearance(cfg)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[LIVE] 悬浮弹窗外观应用失败（不影响悬浮球）: {e}",
+                      flush=True)
         panel = getattr(self, "_live_channel_panel", None)
         if panel is not None:
             panel.set_panel_alpha(cfg.get("panel_alpha", 0.85))
@@ -1254,6 +1320,20 @@ class MainWindow(QMainWindow):
     # 实时且把单次重算的卡顿摊薄到可接受。
     _STATS_REFRESH_INTERVAL = 5.0
 
+    def _request_stats_update(self, force: bool = False):
+        """温升统计刷新的唯一节流入口（整改 Q2-1）。
+
+        analyze_rise 是全量 O(n) 重算（16 通道 8 小时 ≈ 0.8s），实时中一切
+        按帧触发的路径（_flush_live → refresh_plots → _render_visible_tab）
+        必须经本入口节流；切页/加载/参数应用等一次性动作传 force=True 立即
+        刷一次并同步节流时间戳，避免紧随其后的帧再重算一遍。
+        """
+        now = time.time()
+        if not force and now - self._last_stats_update < self._STATS_REFRESH_INTERVAL:
+            return
+        self._last_stats_update = now
+        self._update_stats()
+
     def _flush_live(self):
         """合并多次 data_appended 为一次 UI 刷新。"""
         if not self._live_dirty:
@@ -1261,13 +1341,9 @@ class MainWindow(QMainWindow):
         self._live_dirty = False
         try:
             self.refresh_plots()
-            # 温升统计仅在对应标签页可见时更新，且按 _STATS_REFRESH_INTERVAL
-            # 节流（避免每次刷新都全量重算统计表格，拖慢实时刷新）
-            if (self.tabs.currentIndex() == self.idx_stat
-                    and time.time() - self._last_stats_update
-                    >= self._STATS_REFRESH_INTERVAL):
-                self._last_stats_update = time.time()
-                self._update_stats()
+            # 温升统计刷新已收敛：refresh_plots → _render_visible_tab 在统计页
+            # 可见时经 _request_stats_update 统一 5s 节流（整改 Q2-1），此处不再
+            # 保留第二路触发。
             self._update_source_label()
             # 更新左侧通道表格实时温度
             if hasattr(self, "channel_panel"):
@@ -1629,10 +1705,11 @@ class MainWindow(QMainWindow):
         panel.set_sample_info(int(s.n), time.strftime("%H:%M:%S"))
 
     def _on_channels_changed(self, _keys):
-        """通道配置变化（改名/改色）→ 刷新通道表 + 重绘。"""
+        """通道配置变化（改名/改色）→ 刷新通道表 + 重绘 + 镜像到名称文件。"""
         if not self._loading:
             self.channel_panel.populate()
             self.refresh_plots()
+            self._sync_names_file()
 
     # ==================================================================
     #  从配置文件恢复状态
@@ -1666,6 +1743,8 @@ class MainWindow(QMainWindow):
             pass
         self._load_font_config()
         self._load_name_list()
+        # 通道名称独立文件（权威来源）：存在→应用；缺失→从当前配置生成默认文件
+        self._apply_or_create_names_file()
         self._load_color_config()
         self._load_acq_config()
         self._load_param_config()
@@ -1702,6 +1781,129 @@ class MainWindow(QMainWindow):
             ConfigIO.save_section("name_list", self.name_list)
         except Exception:
             pass
+        # 名称文件只更新池（映射保持文件现状）
+        try:
+            pool = [n for n in (self.name_list or [])
+                    if isinstance(n, str) and n.strip()]
+            channel_names_file.update_pool_in_file(pool)
+        except Exception:
+            pass
+
+    # ==================================================================
+    #  通道名称独立文件（用户数据/config/通道名称-channel-names.json）
+    #  文件是名称的唯一权威来源；settings.json 的 channels/name_list 段
+    #  退为兼容镜像（应用内改名仍同步写回，回退旧版本时名称不丢）。
+    # ==================================================================
+    def _apply_or_create_names_file(self):
+        """启动期：名称文件存在→按文件应用；缺失→从当前配置生成默认文件。"""
+        if store.config is None:
+            return
+        try:
+            if os.path.exists(channel_names_file.NAMES_FILE):
+                self._apply_channel_names_from_file(startup=True)
+            else:
+                self._write_names_file_full()
+        except Exception as exc:
+            print(f"[ChannelNamesFile] 启动处理失败：{exc}", flush=True)
+
+    def _apply_channel_names_from_file(self, startup: bool = False) -> bool:
+        """读取名称文件并应用。
+
+        startup=True（启动期，UI 未建）：静默应用、不广播通知；
+        startup=False（热重载/手动重载）：batch 单次广播 channels_changed
+        → 走既有链路刷新通道表与绘图，并刷新命名弹窗候选，状态栏回执。
+        读取失败时保留当前名称（可诊断降级，不静默清空）。
+        """
+        cfg = store.config
+        if cfg is None:
+            return False
+        try:
+            pool, mapping = channel_names_file.read_names_file()
+        except channel_names_file.NamesFileError as exc:
+            # 损坏现场先备份一份，避免后续镜像写回覆盖掉可手工恢复的内容
+            self._backup_corrupt_names_file()
+            if startup:
+                print(f"[ChannelNamesFile] 启动读取失败，保留当前名称：{exc}",
+                      flush=True)
+            else:
+                self.statusBar().showMessage(
+                    f"通道名称文件读取失败，已保留当前名称：{exc}", 8000)
+            return False
+        with cfg.batch(notify=not startup):
+            # 文件为权威来源：先清全部自定义名再按文件落位
+            # （文件中缺失的键 = 恢复默认显示 CHn）
+            for rec in cfg.channels.values():
+                rec.pop("name", None)
+            for key, name in mapping.items():
+                cfg.channels.setdefault(key, {})["name"] = name
+            # 候选池：文件给了非空池才接管（空池/缺池保持现有池不误清）
+            if pool:
+                cfg.name_pool = list(pool)
+                self.name_list = list(pool)
+        cfg.save()                      # settings.json channels 段镜像
+        self._save_name_list()          # settings.json name_list 段镜像
+        if not startup:
+            self._notify_name_list_changed()
+            named = sum(1 for v in mapping.values() if v)
+            self.statusBar().showMessage(
+                f"通道名称文件已生效：{named} 个通道名、{len(self.name_list)} 个候选名称",
+                5000)
+        return True
+
+    def _on_names_file_changed(self):
+        """名称文件被外部修改（编辑器保存 / 跨机整份替换）→ 即时重载。"""
+        return self._apply_channel_names_from_file(startup=False)
+
+    def _backup_corrupt_names_file(self):
+        """读取失败的名称文件备份一次（.损坏备份 后缀），保留手工恢复现场。"""
+        try:
+            src = channel_names_file.NAMES_FILE
+            if not os.path.exists(src):
+                return
+            dst = src + ".损坏备份"
+            if not os.path.exists(dst):
+                shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+    def _sync_names_file(self):
+        """把当前通道名称映射写入名称文件（改名/重置后由 channels_changed
+        通知链调用，采集启动重置处显式补调）。
+
+        只替换映射、保留文件现有候选池——映射来源于全局共享的
+        store.config，各持有方写入值一致，不会互相踩踏；池的更新只走
+        _save_name_list 显式入口。文件映射语义未变时不写盘（保留用户
+        手工排版）。
+        """
+        cfg = store.config
+        if cfg is None:
+            return
+        try:
+            mapping = {}
+            for key, rec in cfg.channels.items():
+                name = (rec.get("name") or "").strip()
+                if name:
+                    mapping[key] = name
+            channel_names_file.update_mapping_in_file(mapping)
+        except Exception:
+            pass  # 名称文件写失败不阻断改名主流程（settings.json 仍是镜像）
+
+    def _write_names_file_full(self):
+        """把当前名称状态（池+映射）完整写入名称文件（启动生成默认文件）。"""
+        cfg = store.config
+        if cfg is None:
+            return
+        try:
+            mapping = {}
+            for key, rec in cfg.channels.items():
+                name = (rec.get("name") or "").strip()
+                if name:
+                    mapping[key] = name
+            pool = [n for n in (self.name_list or [])
+                    if isinstance(n, str) and n.strip()]
+            channel_names_file.write_names_file(pool, mapping)
+        except Exception:
+            pass
 
     def _load_color_config(self):
         """加载配色模式。channels.json 的 color_mode 是权威来源（避免与
@@ -1719,11 +1921,11 @@ class MainWindow(QMainWindow):
     #  UI 构建
     # ==================================================================
     def _init_ui(self):
-        self._set_window_title("多通道温度分析仪")
+        self._set_window_title("温度爬升分析工具")
         
         # 设置窗口图标
         try:
-            from main import get_icon_path
+            from app import get_icon_path
             icon_path = get_icon_path("app", 256)
             if icon_path:
                 from PyQt5.QtGui import QIcon
@@ -1778,7 +1980,7 @@ class MainWindow(QMainWindow):
                 return
             
             from PyQt5.QtGui import QIcon
-            from main import get_icon_path
+            from app import get_icon_path
             
             tray_path = get_icon_path("tray", 64)
             if not tray_path:
@@ -2592,7 +2794,7 @@ class MainWindow(QMainWindow):
             self._busy_card.finish()
         self._data_mode = "file"
         path = getattr(self, "_import_path", "")
-        self._set_window_title(f"多通道温度分析仪 — {os.path.basename(path)}")
+        self._set_window_title(f"温度爬升分析工具 — {os.path.basename(path)}")
         self.statusBar().showMessage(f"已加载：{os.path.basename(path)} ({s.n} 条记录)")
         # 完成反馈升级为居中轻提示（加载卡片收起后给出明确结果）
         self._notify(
@@ -2643,6 +2845,8 @@ class MainWindow(QMainWindow):
             # 角标「📂 打开文件」→ 与原工具栏文件入口同一处理链路
             dlg.open_file_requested.connect(self.on_open)
             dlg.service_changed.connect(self._on_service_changed)
+            # 角标「📊 跨会话对比」→ 打开跨会话通道对比窗口（非模态）
+            dlg.cross_compare_requested.connect(self._open_cross_compare)
             self._history_dialog = dlg
 
         # 重开时重新打开本机数据库（closeEvent 已释放连接）
@@ -2665,6 +2869,23 @@ class MainWindow(QMainWindow):
         dlg = getattr(self, "_history_dialog", None)
         if dlg is not None:
             dlg.set_client_mode_active(self._client_mode_active)
+
+    def _open_cross_compare(self):
+        """打开「跨会话通道对比」窗口（实例复用、非模态；关闭仅隐藏）。
+
+        窗口只读历史库（自带独立 HistoryDatabase 连接，RLock 与采集
+        写入并发安全），不切换当前会话、不影响实时采集；每次重新显示
+        时自动刷新会话列表并重载勾选曲线。
+        """
+        from ui.dialogs.cross_session_compare_dialog import (
+            CrossSessionCompareDialog)
+        dlg = getattr(self, "_compare_dialog", None)
+        if dlg is None:
+            dlg = CrossSessionCompareDialog(parent=self)
+            self._compare_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _on_history_load_requested(self, info: dict):
         """处理历史会话加载请求：用户确认 → 关闭历史对话框 → 后台解析 → UI 线程挂载。
@@ -2767,7 +2988,7 @@ class MainWindow(QMainWindow):
             self._history_loading = False
         self._data_mode = "file"
         name = info.get('session_name', '') or sess.title
-        self._set_window_title(f"多通道温度分析仪 — 历史: {name}")
+        self._set_window_title(f"温度爬升分析工具 — 历史: {name}")
         self.statusBar().showMessage(f"已从历史数据库加载: {name}", 5000)
         # 完成反馈升级为居中轻提示（加载卡片收起后给出明确结果）
         self._notify(f"已加载历史会话：{name}", "success")
@@ -2923,7 +3144,7 @@ class MainWindow(QMainWindow):
         self._data_mode = "file"
         record_count = (data.get('total') or session.n
                         or session_info.get('record_count') or 0)
-        self._set_window_title(f"多通道温度分析仪 — 远程: {device_label}")
+        self._set_window_title(f"温度爬升分析工具 — 远程: {device_label}")
         self.statusBar().showMessage(
             f"已从远程设备获取: {device_label} ({record_count} 条记录){persist_hint}")
         # 状态栏来源标签：远程数据
@@ -3060,7 +3281,7 @@ class MainWindow(QMainWindow):
         # `import ... as` 会拿到实例；必须用 import_module 取真模块
         # （monitor 需要模块级 parse/merge 函数 + .store 单例方法）
         import importlib
-        store_mod = importlib.import_module('device.datastore.store')
+        store_mod = importlib.import_module('services.datastore.store')
         # 监控启动即进入客户端角色，复用连接时记录的地址显示网络状态
         self._remote_device_label = device_label
         mon = RemoteMonitor(
@@ -3824,6 +4045,9 @@ class MainWindow(QMainWindow):
         session_name, reset_names = naming
         if reset_names:
             store.reset_channel_names()
+            # 名称文件是权威来源：重置后同步清掉文件里的逐通道名
+            # （reset 不广播 channels_changed，需在此显式镜像）
+            self._sync_names_file()
 
         # 按实际启用的通道数创建实时会话
         store.create_live_session(n_channels, interval=interval_sec, keys=keys)
@@ -3843,7 +4067,8 @@ class MainWindow(QMainWindow):
             self._serial_mgr, interval_ms=self._acq_interval_ms,
             group_count=gc, active_groups=use_groups, protocol=_P(),
             proto_mode="new" if proto == "new" else "old",
-            instrument_type=0 if gc == 1 else 1)
+            instrument_type=0 if gc == 1 else 1,
+            frame_sink=store.persist_frame)
         self._acq_worker.data_received.connect(self._on_acq_data)
         self._acq_worker.connection_changed.connect(self._on_acq_connection)
         self._acq_worker.error_occurred.connect(
@@ -3861,6 +4086,8 @@ class MainWindow(QMainWindow):
             self._sync_connect_button()
             return
         self._acq_worker.start()
+        # 报警副作用后台线程随采集启动（DB 事件写 + 线圈输出，P0-3）
+        self._alarm_fx.start()
         # 步骤卡第 3 步进行中：等待首帧数据到达（真实“已连上”信号）
         self._acq_step_card.mark_acquire_active(n_channels)
 
@@ -3882,10 +4109,10 @@ class MainWindow(QMainWindow):
         self._sync_live_ball_visibility()
         if session_name:
             self._set_window_title(
-                f"多通道温度分析仪 — 实时采集中 {session_name} ({n_channels}通道)")
+                f"温度爬升分析工具 — 实时采集中 {session_name} ({n_channels}通道)")
         else:
             self._set_window_title(
-                f"多通道温度分析仪 — 实时采集中 ({n_channels}通道)")
+                f"温度爬升分析工具 — 实时采集中 ({n_channels}通道)")
         self.statusBar().showMessage("采集已开始，正在记录到数据库", 5000)
         # 采集开始的成功反馈由步骤卡承担（全部打勾后停留并自动淡出），
         # 不再叠加顶部 toast；通道数见卡片标题与窗口标题。
@@ -3974,14 +4201,12 @@ class MainWindow(QMainWindow):
             pass
         self._hide_alarm_dialog()
         self._alarm_acked = set()
-        # 关闭报警输出串口（如有）
-        if getattr(self, "_alarm_serial", None) is not None:
-            try:
-                if self._alarm_serial.is_open:
-                    self._alarm_serial.close()
-            except Exception:
-                pass
-            self._alarm_serial = None
+        # 停止报警副作用后台线程：先排空事件写与线圈最终电平，再有界 join
+        # （串口 open/write 全在该线程内，GUI 不再持有任何报警串口，P0-3）
+        try:
+            self._alarm_fx.stop(timeout=3.0)
+        except Exception as exc:
+            print(f"[AlarmFX] 后台线程停止异常：{exc}", flush=True)
         self._alarm_serial_on = False
 
         # 服务保持运行：采集结束不停止，远程客户端可继续查询刚采集的数据；
@@ -4037,7 +4262,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_window_title(self) -> None:
         """TCP 服务状态变化后，按当前基础文案重建窗口标题。"""
-        self._set_window_title(getattr(self, "_title_base", "多通道温度分析仪"))
+        self._set_window_title(getattr(self, "_title_base", "温度爬升分析工具"))
 
     def _init_service_manager(self) -> str:
         """创建 ServiceManager 实例（不启动任何服务），返回本机 IP。
@@ -4060,7 +4285,7 @@ class MainWindow(QMainWindow):
 
             self._service_manager = ServiceManager(
                 history_db=self._history_db,
-                device_name=f"多通道温度分析仪-{local_ip}",
+                device_name=f"MTA-{local_ip}",
                 advertise_ip=ConfigIO.load_network_service_config()
                 .get("advertise_ip", "")
             )
@@ -4142,20 +4367,42 @@ class MainWindow(QMainWindow):
         self._refresh_window_title()
 
     def _on_acq_data(self, timestamp: float, values: list):
-        """采集数据到达 → 送入统一管道（只存有效通道数）。"""
-        # 步骤卡第 3 步：首帧数据真实到达即打勾（内部有状态守卫，逐帧调用安全）
-        self._acq_step_card.mark_acquire_done()
-        # 采集线程发出 Unix 时间戳；统一数据总线的时间轴使用相对秒数。
-        live = store.live
-        start_time = getattr(live, "started_at", None) if live is not None else None
-        abs_timestamp = float(timestamp)  # 保存原始时间戳用于数据库
-        if start_time is not None:
-            timestamp = float(timestamp) - float(start_time)
-        store.append_live(timestamp, values, timestamp=abs_timestamp)
-        # 温度报警判定（仅实时采集；判定逻辑在 core.step_alarm，主线程执行）
-        if self._data_mode == "live":
-            self._check_alarms(abs_timestamp, values)
-        self._hb.beat()
+        """采集数据到达（GUI 线程）→ 只负责展示链路（P1 起持久化已在采集线程完成）。
+
+        落库投递在 AcquisitionWorker.frame_sink=store.persist_frame 中先于
+        Qt 信号完成；此处写内存 buffer / 报警判定 / 心跳，均为 UI 侧职责。
+        P0-4 事件队列护栏：单帧槽耗时 >SLOW_SLOT_WARN_SEC 计数并状态栏
+        告警（不弹窗、不写盘），为卡死现场留可诊断证据。
+        """
+        t0 = time.perf_counter()
+        try:
+            # 步骤卡第 3 步：首帧数据真实到达即打勾（内部有状态守卫，逐帧调用安全）
+            self._acq_step_card.mark_acquire_done()
+            # 采集线程发出 Unix 时间戳；统一数据总线的时间轴使用相对秒数。
+            live = store.live
+            start_time = getattr(live, "started_at", None) if live is not None else None
+            abs_timestamp = float(timestamp)  # 保存原始时间戳用于展示/报警
+            if start_time is not None:
+                timestamp = float(timestamp) - float(start_time)
+            store.append_live(timestamp, values, timestamp=abs_timestamp)
+            # 温度报警判定（仅实时采集；判定逻辑在 core.step_alarm，主线程执行）
+            if self._data_mode == "live":
+                self._check_alarms(abs_timestamp, values)
+            self._hb.beat()
+        finally:
+            self._watch_slow_slot(time.perf_counter() - t0)
+
+    def _watch_slow_slot(self, cost: float):
+        """单帧 GUI 槽耗时护栏：超阈值计数 + 状态栏提示（只读观测，零副作用）。"""
+        if cost <= SLOW_SLOT_WARN_SEC:
+            return
+        self._slow_slot_count += 1
+        print(f"[Perf] 单帧处理耗时 {cost * 1000:.0f}ms"
+              f"（>{SLOW_SLOT_WARN_SEC * 1000:.0f}ms，"
+              f"累计第 {self._slow_slot_count} 次）", flush=True)
+        self.statusBar().showMessage(
+            f"⚠ 界面单帧处理 {cost * 1000:.0f}ms（累计 {self._slow_slot_count} 次）",
+            5000)
 
     # ==================================================================
     #  温度报警判定（仅实时采集）
@@ -4174,8 +4421,14 @@ class MainWindow(QMainWindow):
         for ch_idx, atype, kind, actual in events:
             if kind == "active":
                 self._on_alarm_active(ch_idx, atype, actual)
-            else:
+            elif kind == "retrigger":
+                self._on_alarm_retrigger(ch_idx, atype, actual)
+            elif kind == "cleared":
                 self._on_alarm_cleared(ch_idx, atype, actual)
+            else:
+                # 未知 kind 绝不静默误路由（整改 Q2-2 审计项：二分支 else
+                # 会把新事件类型当 cleared 处理）
+                print(f"[Alarm] 未知报警事件类型 {kind!r}，已忽略", flush=True)
 
     @staticmethod
     def _alarm_channel_label(ch_idx):
@@ -4193,8 +4446,8 @@ class MainWindow(QMainWindow):
         return card.current_name()
 
     def _channel_has_any_alarm(self, idx):
-        """该通道是否仍有任意类型的 active 报警（决定是否清除高亮）。"""
-        return any(k[0] == idx and st == "active"
+        """该通道是否仍有任意类型报警进行中（active/clearing，决定是否清除高亮）。"""
+        return any(k[0] == idx and core.alarm_active(st)
                    for k, st in self._alarm_states.items())
 
     def _on_alarm_active(self, ch_idx, atype, actual):
@@ -4215,6 +4468,20 @@ class MainWindow(QMainWindow):
         if cfg.act_sound and not alarm_loop_active():
             start_alarm_loop()
         self._update_alarm_serial_output()
+
+    def _on_alarm_retrigger(self, ch_idx, atype, actual):
+        """clearing 期违规复现（恢复失败）：撤销确认标记并按新报警重新提醒。
+
+        core 仅在 clearing→active 边沿发本事件（active 期复现不发），频率
+        上界=恢复尝试次数且被滞回+hold 钳制；用户 ack 后温度再次飙升不再
+        全静默（整改 Q2-2）。_on_alarm_active 各输出均幂等/合并安全，直接复用。
+        """
+        was_acked = (ch_idx, atype) in self._alarm_acked
+        self._alarm_acked.discard((ch_idx, atype))
+        if was_acked:
+            print(f"[Alarm] {self._alarm_channel_label(ch_idx)} 已确认报警"
+                  f"恢复失败，重新触发提醒", flush=True)
+        self._on_alarm_active(ch_idx, atype, actual)
 
     def _on_alarm_cleared(self, ch_idx, atype, actual):
         """报警恢复正常：清除该类型高亮 + 写 cleared + 移除确认标记 + 刷新弹窗 / 声音。"""
@@ -4241,7 +4508,7 @@ class MainWindow(QMainWindow):
             return
         active = sorted(
             ((idx, atype) for (idx, atype), st in self._alarm_states.items()
-             if st == "active"),
+             if core.alarm_active(st)),
             key=lambda e: ((e[0] if e[0] is not None else -1), e[1]))
         if not active:
             self._alarm_label.setText("")
@@ -4271,15 +4538,23 @@ class MainWindow(QMainWindow):
                 "diff": c.diff_threshold}.get(atype)
 
     def _record_alarm_event(self, ch_idx, atype, actual, status):
-        """写一条报警事件到历史库；无历史库或非实时会话则跳过。"""
+        """投递一条报警事件到后台落库队列；非实时会话则跳过。
+
+        实际的 SQLite 写入由 AlarmSideEffects 后台线程合并执行，
+        GUI 线程不做任何磁盘 I/O。
+        """
         try:
             db = getattr(self, "_history_db", None)
             if db is None:
                 return
-            s = store.active
+            # 整改 N-1：事件永远属于「正在采集」的会话——取 store.live 而非
+            # store.active（浏览历史页时 active 是历史会话，报警事件会被丢）；
+            # 数据库会话 ID 唯一权威来源是 Recorder（Session 对象只有 .id，
+            # 旧 getattr(s,"session_id") 恒空 → 落库投递是死代码）。
+            s = store.live
             if s is None or not getattr(s, "is_live", False):
                 return
-            session_id = getattr(s, "session_id", "") or ""
+            session_id = store.recorder.session_id
             if not session_id:
                 return
             if ch_idx is None:
@@ -4287,11 +4562,11 @@ class MainWindow(QMainWindow):
             else:
                 ch = s.channel_by_index(ch_idx)
                 ch_key = ch.key if ch is not None else f"CH{ch_idx + 1}"
-            db.insert_alarm_event(
+            self._alarm_fx.enqueue_alarm_event(
                 session_id, ch_key, time.time(), atype,
                 self._alarm_threshold_for(atype), actual, status)
         except Exception as exc:
-            print(f"[Alarm] 写历史失败：{exc}", flush=True)
+            print(f"[Alarm] 投递报警事件失败：{exc}", flush=True)
 
     def _ack_alarms(self):
         """复位（确认静音）：所有 active 报警标记已确认 → 停声音、关弹窗。
@@ -4299,7 +4574,7 @@ class MainWindow(QMainWindow):
         曲线高亮与状态栏指示保持不变，直到温度真正恢复正常后自动清除。
         """
         for key, st in self._alarm_states.items():
-            if st == "active":
+            if core.alarm_active(st):
                 self._alarm_acked.add(key)
         stop_alarm_loop()
         self._hide_alarm_dialog()
@@ -4307,15 +4582,15 @@ class MainWindow(QMainWindow):
             "报警已复位（确认静音），高亮保持到温度恢复正常", 3000)
 
     def _has_unacked_active(self):
-        """是否存在未确认（未复位）的 active 报警。"""
-        return any(st == "active" and k not in self._alarm_acked
+        """是否存在未确认（未复位）的进行中报警（active/clearing）。"""
+        return any(core.alarm_active(st) and k not in self._alarm_acked
                    for k, st in self._alarm_states.items())
 
     def _unacked_active_items(self):
-        """生成未确认 active 报警的显示文本列表（供报警窗）。"""
+        """生成未确认进行中报警的显示文本列表（供报警窗）。"""
         items = []
         for (idx, atype), st in self._alarm_states.items():
-            if st != "active" or (idx, atype) in self._alarm_acked:
+            if not core.alarm_active(st) or (idx, atype) in self._alarm_acked:
                 continue
             ch = "通道间温差" if idx is None else self._alarm_channel_label(idx)
             items.append(f"{ch}    {self._alarm_type_label(atype)}")
@@ -4344,38 +4619,14 @@ class MainWindow(QMainWindow):
         cfg = self.alarm_config
         if not cfg.act_serial or not cfg.serial_port:
             return
-        has_active = any(st == "active" for st in self._alarm_states.values())
+        has_active = any(core.alarm_active(st)
+                         for st in self._alarm_states.values())
         if has_active and not self._alarm_serial_on:
-            self._send_alarm_coil(True)
+            self._alarm_fx.set_coil_target(True)
             self._alarm_serial_on = True
         elif not has_active and self._alarm_serial_on:
-            self._send_alarm_coil(False)
+            self._alarm_fx.set_coil_target(False)
             self._alarm_serial_on = False
-
-    def _send_alarm_coil(self, on):
-        """通过独立报警串口发送 Modbus 写线圈帧；失败静默不阻断采集。"""
-        cfg = self.alarm_config
-        try:
-            self._ensure_alarm_serial()
-            if self._alarm_serial is None:
-                return
-            frame = build_write_single_coil(
-                cfg.modbus_slave, cfg.modbus_coil, on)
-            self._alarm_serial.write(frame)
-        except Exception as exc:
-            print(f"[Alarm] 串口输出失败：{exc}", flush=True)
-
-    def _ensure_alarm_serial(self):
-        """按需创建并打开独立报警串口（绝不复用采集串口）。"""
-        cfg = self.alarm_config
-        if not cfg.act_serial or not cfg.serial_port:
-            return
-        if self._alarm_serial is None:
-            from device.acquisition import SerialPortManager
-            self._alarm_serial = SerialPortManager()
-        if not self._alarm_serial.is_open:
-            if not self._alarm_serial.open(cfg.serial_port, cfg.serial_baud):
-                print(f"[Alarm] 报警串口 {cfg.serial_port} 打开失败", flush=True)
 
     def _on_acq_worker_finished(self):
         """后台采集线程最终退出后，从 exiting 池移除（C4 兜底）。"""
@@ -4735,7 +4986,7 @@ class MainWindow(QMainWindow):
     def _finish_recompute(self) -> None:
         """重算完成后刷新界面（UI 线程）。"""
         self.refresh_plots()
-        self._update_stats()
+        self._request_stats_update(force=True)
         self._save_param_config()  # 参数应用时自动持久化
         self.statusBar().showMessage("已刷新", 2000)
         self._set_settings_page_status("已应用并刷新", "success")
@@ -4912,9 +5163,11 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, idx):
         """切换标签页时委托给 ChartRenderer 渲染当前页"""
         self._set_current_tab_semantic(self.tabs, idx)
-        self.chart_renderer._render_visible_tab()
         if idx == self.idx_stat:
-            self.stat_panel.update_stats()
+            # 切到统计页立即刷一次（其后回 5s 节流）；由 _render_visible_tab
+            # 内的 _request_stats_update 统一触发，不再二次直调（整改 Q2-1）
+            self._last_stats_update = 0.0
+        self.chart_renderer._render_visible_tab()
 
     # ==================================================================
     #  统计
@@ -4991,7 +5244,7 @@ class MainWindow(QMainWindow):
         ConfigIO.save_rise_config(self)
         if self.stat_panel is not None:
             self.stat_panel.clear_result_cache()
-        self._update_stats()
+        self._request_stats_update(force=True)
         self.statusBar().showMessage("温升分析参数已应用", 2000)
         self._set_settings_page_status("已应用并保存", "success")
 
@@ -5000,6 +5253,9 @@ class MainWindow(QMainWindow):
 
         覆盖轴基础窗口全部写路径（左快调区 / 设置·轴设置页应用 / 配置热重载）
         与启动加载；自定义模式不干预。图表经 refresh_plots 重画阈值线。
+        扳机防护（P1-5 F4）：实时采集中把上限压到近窗最高温之下会立即
+        全通道触发报警（边沿风暴入口），给出一次性醒目提示但不阻断——
+        用户有权故意这么做。
         """
         cfg = self.alarm_config
         if not cfg.follow_axis:
@@ -5013,6 +5269,7 @@ class MainWindow(QMainWindow):
             return
         self.alarm_config = _dc_replace(cfg, temp_high=new_high).normalized()
         ConfigIO.save_alarm_config(self)
+        self._warn_alarm_high_below_live_temp(new_high)
         if getattr(self, "chart_renderer", None) is not None:
             self.refresh_plots()
         dlg = getattr(self, "settings_dlg", None)
@@ -5021,6 +5278,25 @@ class MainWindow(QMainWindow):
             dlg.alm_high.blockSignals(True)
             dlg.alm_high.setValue(self.alarm_config.temp_high)
             dlg.alm_high.blockSignals(False)
+
+    def _warn_alarm_high_below_live_temp(self, new_high):
+        """报警上限降到实时近窗最高温之下时的一次性状态栏提示（F4，只提示不阻断）。"""
+        try:
+            if not self.alarm_config.enabled:
+                return
+            renderer = getattr(self, "chart_renderer", None)
+            if renderer is None:
+                return
+            _wmin, wmax = renderer._live_window_bounds()
+            if wmax is None or new_high > wmax:
+                return
+            bar = getattr(self, "statusBar", None)
+            if bar is not None:
+                bar().showMessage(
+                    f"⚠ 报警上限已低于当前采集温度（近窗最高 {wmax:g}℃），"
+                    f"将立即触发报警", 8000)
+        except Exception as e:
+            print(f"[ALARM] 上限低于现温提示异常（忽略）: {e}", flush=True)
 
     def _apply_alarm_page(self):
         """应用报警设置页参数 → 保存 → 热生效。
@@ -5051,6 +5327,9 @@ class MainWindow(QMainWindow):
                 modbus_slave=dlg.alm_modbus_slave.value(),
                 modbus_coil=dlg.alm_modbus_coil.value(),
                 sound_file=self.alarm_config.sound_file,
+                # 恢复滞回参数不经设置页控件（本批决策），重建时原值透传
+                clear_margin=self.alarm_config.clear_margin,
+                clear_hold_sec=self.alarm_config.clear_hold_sec,
             ).normalized()
         self._sync_alarm_high_to_axis()
         ConfigIO.save_alarm_config(self)
@@ -5500,9 +5779,18 @@ class MainWindow(QMainWindow):
         self._apply_channel_view_mode(mode, silent=True)
 
     def _load_storage_config(self):
-        """加载数据存储配置：写入间隔固定为 1 分钟，不再读取用户配置"""
-        # 数据库批量写入间隔固定为 1 分钟，无需用户配置
-        self._db_write_interval = 1.0
+        """加载数据存储配置：落库间隔读 storage.db_flush_sec（P1，秒，钳 [0.5,300]）。
+
+        旧配置无该分区/键 → 默认 1 秒（逐秒持久化底线），零迁移兼容。
+        """
+        db_flush_sec = 1.0
+        try:
+            d = ConfigIO.load_section("storage", {}, ())
+            if isinstance(d, dict) and d.get("db_flush_sec") is not None:
+                db_flush_sec = float(d.get("db_flush_sec"))
+        except Exception:
+            db_flush_sec = 1.0
+        self._db_write_interval = min(300.0, max(0.5, db_flush_sec))
 
         # 初始化数据库
         self._init_history_database()
@@ -5535,6 +5823,147 @@ class MainWindow(QMainWindow):
             # 仅数据库存储模式下数据库不可用则禁止开始采集，
             # 避免采集数据无处落盘。
             print("[DB] 数据库不可用：采集将被禁止（数据仅允许保存到数据库）", flush=True)
+            return
+
+        # P1-3：扫描上次异常退出残留的落库兜底文件，提示回灌（不自动动数据）
+        QTimer.singleShot(2000, self._check_spill_recovery)
+
+        # 旧版本包数据库扫描（跨版本升级迁移）：延后 6 秒后台扫整盘
+        # 特征点，扫到候选才弹窗询问，不挡启动与串口设置流程。
+        QTimer.singleShot(6000, self._check_old_version_data)
+
+    def _check_spill_recovery(self):
+        """启动后检查 wal_spill 兜底文件；发现残留则征询用户回灌入库。"""
+        try:
+            if self._history_db is None:
+                return
+            from device.datastore import spill
+            files = spill.find_residual_files()
+            if not files:
+                return
+            total = sum(spill.count_rows(p) for p in files)
+            if total <= 0:
+                for p in files:      # 空文件直接清理
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                return
+            ret = QMessageBox.question(
+                self, "发现未入库的兜底采集数据",
+                f"检测到上次运行有 {total} 行采集数据未能写入数据库"
+                f"（{len(files)} 个兜底文件）。\n\n"
+                "是否立即回灌入库？回灌成功后文件将标记为已完成。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ret != QMessageBox.Yes:
+                self.statusBar().showMessage(
+                    f"未入库兜底数据 {total} 行仍保留在兜底文件中", 8000)
+                return
+            result = spill.replay_all(self._history_db)
+            errs = result.get("errors") or []
+            if errs:
+                QMessageBox.warning(
+                    self, "兜底数据回灌未完全成功",
+                    "\n".join(errs) + "\n\n未成功的文件已保留，可稍后重试。")
+            else:
+                QMessageBox.information(
+                    self, "兜底数据回灌完成",
+                    f"已回灌 {result['rows']} 行采集数据入库。")
+                self.statusBar().showMessage(
+                    f"兜底数据已回灌 {result['rows']} 行入库", 5000)
+        except Exception as e:
+            print(f"[DB] 兜底文件回灌检查失败（不影响启动）: {e}", flush=True)
+
+    # ==================================================================
+    #  旧版本包数据库迁移（跨版本升级，扫描器见 utils/old_db_scanner.py）
+    # ==================================================================
+    def _check_old_version_data(self):
+        """启动延后触发的旧版本库扫描：后台线程扫整盘特征点，有候选才弹窗。
+
+        已迁移/已「不再提示」的库经 .old_db_migrations.json 过滤；
+        「本次跳过」的库下次启动会再询问一次。测试/冒烟环境经
+        MTA_SKIP_OLD_DB_SCAN=1 整体禁用。
+        """
+        if os.environ.get("MTA_SKIP_OLD_DB_SCAN") == "1":
+            return
+        if self._history_db is None:
+            return
+        if getattr(self, "_old_db_scan_worker", None) is not None:
+            return  # 上一次扫描未结束（防御重复触发）
+        from utils import old_db_scanner
+        self._old_db_abort = False
+        worker = _BackgroundWorker(
+            old_db_scanner.scan_with_probe,
+            should_abort=lambda: bool(getattr(self, "_old_db_abort", False)))
+        self._old_db_scan_worker = worker
+        worker.done.connect(self._on_old_db_scan_done)
+        worker.failed.connect(
+            lambda msg: print(f"[迁移] 旧版本库扫描失败: {msg}", flush=True))
+        worker.finished.connect(
+            lambda: setattr(self, "_old_db_scan_worker", None))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_old_db_scan_done(self, candidates):
+        """扫描完成：过滤已决定项；仍有候选则弹迁移选择框并按选择执行。"""
+        from utils import old_db_scanner
+        pending = old_db_scanner.filter_by_decisions(
+            candidates, old_db_scanner.load_decisions())
+        if not pending:
+            return
+        from ui.dialogs.old_db_migrate_dialog import OldDbMigrateDialog
+        dlg = OldDbMigrateDialog(pending, self)
+        if dlg.exec_() != OldDbMigrateDialog.Accepted:
+            # 取消：按勾选决定记录，避免每次启动对同一批库重复打扰
+            choice = "never" if dlg.never_ask_unselected else "skip"
+            for c in pending:
+                old_db_scanner.record_decision(c["db_path"], choice)
+            return
+        selected = dlg.selected_candidates()
+        un_choice = "never" if dlg.never_ask_unselected else "skip"
+        for c in pending:
+            if c not in selected:
+                old_db_scanner.record_decision(c["db_path"], un_choice)
+        if selected:
+            self._start_old_db_import(selected)
+
+    def _start_old_db_import(self, selected):
+        """后台把选中的旧库逐个合并进本机默认库；进度进状态栏。"""
+        paths = [c["db_path"] for c in selected]
+        self._old_db_import_worker = _OldDbImportWorker(
+            self._history_db, paths, self)
+        self._old_db_import_worker.progress.connect(
+            lambda i, n, _p: self.statusBar().showMessage(
+                f"正在迁移旧版本数据库（{i}/{n}）…", 0))
+        self._old_db_import_worker.done.connect(self._on_old_db_import_done)
+        self._old_db_import_worker.failed.connect(
+            self._on_old_db_import_failed)
+        self._old_db_import_worker.finished.connect(
+            lambda: setattr(self, "_old_db_import_worker", None))
+        self._old_db_import_worker.finished.connect(
+            self._old_db_import_worker.deleteLater)
+        self._old_db_import_worker.start()
+
+    def _on_old_db_import_done(self, results):
+        """迁移完成：记录决定（免重复弹窗）+ 汇总提示。"""
+        from utils import old_db_scanner
+        for path, imported, _skipped, _failed in results:
+            old_db_scanner.record_decision(
+                path, "migrated", imported=imported)
+        total_imported = sum(r[1] for r in results)
+        total_skipped = sum(r[2] for r in results)
+        total_failed = sum(r[3] for r in results)
+        self.statusBar().showMessage("旧版本数据迁移完成", 8000)
+        QMessageBox.information(
+            self, "迁移完成",
+            "旧版本历史数据已合并进当前数据库：\n"
+            f"新导入 {total_imported} 个会话，跳过 {total_skipped} 个（已存在）"
+            + (f"，失败 {total_failed} 个。" if total_failed else "。")
+            + "\n\n在「数据」对话框中即可查看历史记录。")
+
+    def _on_old_db_import_failed(self, msg):
+        self.statusBar().showMessage("旧版本数据迁移失败", 8000)
+        QMessageBox.warning(self, "迁移失败", msg)
 
     def _purge_expired_sessions_bg(self):
         """后台执行保留策略（硬编码保留最近 30 天）。
@@ -5668,6 +6097,11 @@ class MainWindow(QMainWindow):
         hist_dlg = getattr(self, "_history_dialog", None)
         if hist_dlg is not None and hasattr(hist_dlg, "refresh_theme"):
             hist_dlg.refresh_theme()
+        # 跨会话对比窗口（实例复用、关闭仅隐藏）：画布/表格/列表局部样式
+        # 构造期固化，重放防切主题后重开停留旧配色
+        cmp_dlg = getattr(self, "_compare_dialog", None)
+        if cmp_dlg is not None and hasattr(cmp_dlg, "refresh_theme"):
+            cmp_dlg.refresh_theme()
         # 通道命名弹窗（实例复用、关闭仅隐藏）：整窗 QSS 构造期 format
         # 固化且优先于全局 QSS，须显式重设
         naming_dlg = getattr(self, "_naming_dialog", None)
@@ -6033,6 +6467,17 @@ class MainWindow(QMainWindow):
             panel.hide_panel()
         if self._acq_state in ("acquiring", "paused"):
             self._stop_acquisition(notify_done=False)
+        # 旧版本库后台扫描/迁移线程收尾：扫描置中止标记短暂等待；迁移
+        # 在库间中止后等待（单库合并不中断，部分合并可由下次重扫续迁）。
+        # 最小化到托盘路径不经过这里，后台扫描继续。
+        self._old_db_abort = True
+        scan_w = getattr(self, "_old_db_scan_worker", None)
+        if scan_w is not None and scan_w.isRunning():
+            scan_w.wait(3000)
+        imp_w = getattr(self, "_old_db_import_worker", None)
+        if imp_w is not None and imp_w.isRunning():
+            imp_w.abort()
+            imp_w.wait(8000)
         super().closeEvent(event)
 
     def closeEvent(self, event) -> None:

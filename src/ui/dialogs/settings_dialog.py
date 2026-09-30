@@ -22,7 +22,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtWidgets import QAbstractSpinBox
 
 from utils.config_io import (
-    ConfigIO, LIVE_WINDOW_SEC_CHOICES, LIVE_WINDOW_SEC_DEFAULT, parse_percent)
+    ConfigIO, LIVE_MONITOR_DEFAULTS, LIVE_WINDOW_SEC_CHOICES,
+    LIVE_WINDOW_SEC_DEFAULT, parse_percent)
 from utils.helpers import px_to_pt
 from ui.theme import Theme
 from ui.dialogs.channel_naming_dialog import NameListDelegate
@@ -127,6 +128,10 @@ class SettingsDialog(QDialog):
 
     # 弹窗内输入控件统一固定宽度（像素），保证长中文文字完全显示
     _INW = 220
+    # 悬浮监控页取色按钮/色值输入/恢复按钮统一尺寸（替代散落魔法数，视觉值不变）
+    _SWATCH = (48, 22)
+    _HEX_W = 120
+    _RESET_W = 96
     _DEFAULT_SIZE = (1000, 680)
     _MIN_SIZE = (920, 600)
     # 与 MainWindow.open_settings 的 page_names 一致（依赖其导航索引）
@@ -389,19 +394,25 @@ class SettingsDialog(QDialog):
         return page, lay
 
     def _page_intro(self, lay, text):
-        """分类说明（顶部一段提示文字，非卡片）。"""
+        """分类说明（T1 教程/提示卡，样式统一由 _apply_style 的
+        settingsPageIntro 规则提供：卡片底 + 左侧强调条）。
+
+        控件级只烘焙字号——非文字垂直占位由 QSS 的 padding+border 决定
+        （整改计划 §4 T1：冻结页高度预算，禁止在此加 padding/border）。
+        """
         t = QLabel(text)
         t.setObjectName("settingsPageIntro")
         t.setWordWrap(True)
         fs = self.parent._current_font["intro"]
         # 文字色不烘焙：由 _apply_style 的 settingsPageIntro 规则按当前主题给出
-        t.setStyleSheet(
-            f"font-size:{px_to_pt(fs)}pt;line-height:1.4;"
-            f"padding:0 2px 4px 2px;border-bottom:1px solid {Theme.BORDER};")
+        t.setStyleSheet(f"font-size:{px_to_pt(fs)}pt;line-height:1.4;")
         lay.addWidget(t)
 
-    def _compact_grid(self, parent_layout, cards, object_name):
-        """将参数卡片按两列排列，减少页面纵向高度。"""
+    def _compact_grid(self, parent_layout, cards, object_name, dense=False):
+        """将参数卡片按两列排列，减少页面纵向高度。
+
+        dense=True 保持紧凑间距（高度冻结页专用，见整改计划 §6 杠杆 1）。
+        """
         grid_widget = QWidget()
         grid_widget.setObjectName(object_name)
         grid_widget.setMinimumWidth(0)
@@ -409,7 +420,7 @@ class SettingsDialog(QDialog):
         grid = QGridLayout(grid_widget)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(3)
+        grid.setVerticalSpacing(3 if dense else 8)
         for index, card in enumerate(cards):
             grid.addWidget(card, index // 2, index % 2)
         grid.setColumnStretch(0, 1)
@@ -417,15 +428,21 @@ class SettingsDialog(QDialog):
         parent_layout.addWidget(grid_widget)
         return grid_widget
 
-    def _param_card(self, title, control, desc):
-        """参数行（无边框留白块）：顶部左右「参数名称 + 输入控件」，下方说明文字。"""
+    def _param_card(self, title, control, desc, dense=False):
+        """参数行（无边框留白块）：顶部左右「参数名称 + 输入控件」，下方说明文字。
+
+        dense=True 保持紧凑留白（高度冻结页专用）。
+        """
         card = QWidget()
         card.setObjectName("paramCard")
         card.setMinimumWidth(0)
         card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(card)
-        v.setContentsMargins(2, 2, 2, 2)
-        v.setSpacing(3)
+        if dense:
+            v.setContentsMargins(2, 2, 2, 2)
+        else:
+            v.setContentsMargins(6, 3, 6, 3)
+        v.setSpacing(3 if dense else 4)
         top = QHBoxLayout()
         top.setSpacing(8)
         nm = QLabel(title)
@@ -452,20 +469,24 @@ class SettingsDialog(QDialog):
             v.addWidget(d)
         return card
 
-    def _section_card(self, title, body, desc):
+    def _section_card(self, title, body, desc, dense=False):
         """分区卡片：QGroupBox 原生标题框 + 主体控件（表格 / 按钮组等）+ 说明。
 
         所有分区统一使用 QGroupBox，标题为原生 ::title（位于边框线上），
         说明文字保留在内容区、可选中复制。objectName 固定为 "sectionCard"，
         供测试与外部查找；调用方可在返回后再 setObjectName 覆盖。
+        dense=True 保持紧凑内边距（高度冻结页专用）。
         """
         group = QGroupBox(title)
         group.setObjectName("sectionCard")
         group.setMinimumWidth(0)
         group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(group)
-        v.setContentsMargins(6, 1, 6, 2)
-        v.setSpacing(4)
+        if dense:
+            v.setContentsMargins(6, 1, 6, 2)
+        else:
+            v.setContentsMargins(10, 4, 10, 6)
+        v.setSpacing(4 if dense else 6)
         if body is not None:
             v.addWidget(body)
         if desc:
@@ -490,8 +511,8 @@ class SettingsDialog(QDialog):
         group.setMinimumWidth(0)
         group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         v = QVBoxLayout(group)
-        v.setContentsMargins(6, 2, 6, 6)
-        v.setSpacing(4)
+        v.setContentsMargins(10, 4, 10, 6)
+        v.setSpacing(6)
         header = QHBoxLayout()
         header.setSpacing(8)
         switch.setStyleSheet("font-weight:600;")
@@ -594,11 +615,15 @@ class SettingsDialog(QDialog):
             QWidget#paramCard:hover {{
                 border-color:{Theme.BORDER};
             }}
+            /* T1 教程/提示卡：卡片底 + 左侧强调条（非文字垂直占位 ≈7px，
+               冻结页高度预算见整改计划 §4；颜色均为 refresh_theme_colors 键） */
             QLabel#settingsPageIntro {{
                 color:{Theme.TEXT_MUTED};
-                background:transparent;
-                padding:6px 8px 9px 8px;
-                border-bottom:1px solid {Theme.BORDER};
+                background:{Theme.BG_CARD};
+                border:1px solid {Theme.BORDER};
+                border-left:3px solid {Theme.ACCENT};
+                border-radius:{Theme.RADIUS}px;
+                padding:1px 10px 2px 10px;
             }}
             QLabel#settingsSectionHeader {{
                 color:{Theme.readable_text(Theme.ACCENT, Theme.BG_PRIMARY)};
@@ -1011,14 +1036,15 @@ class SettingsDialog(QDialog):
             "新版协议支持读取；旧版协议没有读取通道配置指令。")
         self.btn_read_sampling.clicked.connect(self.parent._read_sampling_channels)
         self.btn_write_sampling.clicked.connect(self.parent._write_sampling_channels)
+        buttons.addStretch(1)
         for btn in (self.btn_read_sampling, self.btn_write_sampling):
             buttons.addWidget(btn)
-        buttons.addStretch(1)
-        body_lay.addLayout(buttons)
 
+        # 状态行在上、操作按钮右下对齐：读写动作收尾于卡底（整改计划 F-10）
         self.lbl_sampling_status = QLabel("尚未读取仪器通道状态")
         self.lbl_sampling_status.setStyleSheet(f"color:{Theme.TEXT_MUTED};")
         body_lay.addWidget(self.lbl_sampling_status)
+        body_lay.addLayout(buttons)
         sampling_card = self._section_card(
             "采样通道设置", body,
             "勾选状态表示仪器将参与采样的通道。写入后会自动回读确认；采集运行中不能操作。")
@@ -1508,25 +1534,24 @@ class SettingsDialog(QDialog):
                              "前N分钟导出图的左侧通道统计栏可在本页开关；整体趋势图始终显示统计栏。"
                              "修改即时生效并自动保存，重启沿用。")
 
-        sec_front = QWidget()
-        sfl = QHBoxLayout(sec_front)
-        sfl.setContentsMargins(0, 0, 0, 0)
-        sfl.setSpacing(10)
         self.ov_w1 = QDoubleSpinBox(); self.ov_w1.setRange(0.5, 1e6)
         self.ov_w1.setDecimals(1); self.ov_w1.setValue(self.parent.win_front[0])
         self.ov_w2 = QDoubleSpinBox(); self.ov_w2.setRange(0.5, 1e6)
         self.ov_w2.setDecimals(1); self.ov_w2.setValue(self.parent.win_front[1])
         self.ov_w3 = QDoubleSpinBox(); self.ov_w3.setRange(0.5, 1e6)
         self.ov_w3.setDecimals(1); self.ov_w3.setValue(self.parent.win_front[2])
-        sfl.addWidget(self._param_card(
-            "概览标签页 1 时长（分钟）", self._fix_input(self.ov_w1),
-            "第 1 个概览窗口。"))
-        sfl.addWidget(self._param_card(
-            "概览标签页 2 时长（分钟）", self._fix_input(self.ov_w2),
-            "第 2 个概览窗口。"))
-        sfl.addWidget(self._param_card(
-            "概览标签页 3 时长（分钟）", self._fix_input(self.ov_w3),
-            "第 3 个概览窗口。"))
+        # 三张参数卡硬挤一行时长标题与控件互相挤压：改双列网格（整改计划 P-1）
+        sec_front = QWidget()
+        sfl = QVBoxLayout(sec_front)
+        sfl.setContentsMargins(0, 0, 0, 0)
+        self._compact_grid(sfl, [
+            self._param_card("概览标签页 1 时长（分钟）",
+                             self._fix_input(self.ov_w1), "第 1 个概览窗口。"),
+            self._param_card("概览标签页 2 时长（分钟）",
+                             self._fix_input(self.ov_w2), "第 2 个概览窗口。"),
+            self._param_card("概览标签页 3 时长（分钟）",
+                             self._fix_input(self.ov_w3), "第 3 个概览窗口。"),
+        ], "overviewWindowGrid")
         overview_window_card = self._section_card(
             "概览标签页时间窗口", sec_front,
             "这三个数值决定右侧画布「前N分钟」三个概览标签页各自展示的时间长度，"
@@ -1543,7 +1568,7 @@ class SettingsDialog(QDialog):
         self.ov_show_window_stats.setChecked(
             bool(getattr(self.parent, "show_window_stats", True)))
         stats_setting_card = self._section_card(
-            "概览图统计栏", self.ov_show_window_stats,
+            "概览图统计栏", self._row_widget(self.ov_show_window_stats),
             "整体趋势图固定带统计栏；关闭后仅隐藏前 10、20、30 分钟导出图的统计栏。")
         stats_setting_card.setObjectName("overviewStatsSection")
         lay.addWidget(stats_setting_card)
@@ -1574,13 +1599,10 @@ class SettingsDialog(QDialog):
         self.lm_card_color = cfg["card_color"]
         # 趋势线色：空串=跟随主题强调色，非空=用户自定义色（优先于主题色）
         self.lm_line_color = cfg.get("line_color", "")
-        grid = QWidget()
-        gl = QGridLayout(grid)
-        gl.setContentsMargins(0, 0, 0, 0)
-        gl.setSpacing(10)
-
+        # 本页为高度冻结页（整改计划 §2.5）：布局辅助一律 dense=True，
+        # 外观 / 悬浮球与桌宠 / 全通道面板 / 生态舱 四分区按模块分型排布。
         self.lm_card_color_btn = QPushButton()
-        self.lm_card_color_btn.setFixedSize(48, 22)
+        self.lm_card_color_btn.setFixedSize(*self._SWATCH)
         # 透明度改用文本输入框：允许直接键入 100% / 0%，并对越界与非法输入给出
         # 提示，不再像 QSpinBox(30~95) 那样把 100 静默截断为 95、0 抬成 30。
         self.lm_card_alpha_in = PercentLineEdit(0.0, 100.0, self)
@@ -1617,41 +1639,48 @@ class SettingsDialog(QDialog):
         lr.setContentsMargins(0, 0, 0, 0)
         lr.setSpacing(6)
         self.lm_line_color_btn = QPushButton()
-        self.lm_line_color_btn.setFixedSize(48, 22)
+        self.lm_line_color_btn.setFixedSize(*self._SWATCH)
         self.lm_line_color_edit = QLineEdit()
         self.lm_line_color_edit.setPlaceholderText("跟随主题")
-        self.lm_line_color_edit.setMaximumWidth(120)
+        self.lm_line_color_edit.setMaximumWidth(self._HEX_W)
         self.lm_line_color_edit.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lm_line_reset_btn = QPushButton("恢复默认")
-        self.lm_line_reset_btn.setMaximumWidth(96)
+        self.lm_line_reset_btn.setMaximumWidth(self._RESET_W)
         self.lm_line_reset_btn.setToolTip("清除自定义趋势色，回到跟随当前主题")
         lr.addWidget(self.lm_line_color_btn)
         lr.addWidget(self.lm_line_color_edit, 1)
         lr.addWidget(self.lm_line_reset_btn)
 
-        gl.addWidget(self._param_card(
-            "卡片底色", self.lm_card_color_btn,
-            "整卡唯一颜色，点击取色。"), 0, 0)
-        gl.addWidget(self._param_card(
-            "卡片透明度", alpha_wrap,
-            "0 % 全透明，100 % 完全不透明；可输入「100%」或「60」。"
-            "越界或非法会给出提示并自动修正。"), 0, 1)
-        gl.addWidget(self._param_card(
-            "趋势线/填充色", line_row,
+        line_card = self._param_card("趋势线/填充色", line_row, "")
+        line_card.setToolTip(
             "留空=跟随当前主题强调色（切换主题自动同步）；"
-            "填写 #rrggbb 或点击取色即自定义，自定义色优先级最高。"), 1, 0)
-        gl.addWidget(self._param_card(
-            "时间窗口", self._fix_input(self.lm_window_sec_sp),
-            "曲线显示最近多少秒；与弹窗顶部滑块同步。"), 1, 1)
-        gl.addWidget(self._param_card(
-            "悬浮球大小", self._fix_input(self.lm_ball_size_sp),
-            "悬浮球直径像素。"), 2, 0)
-        gl.addWidget(self._param_card(
-            "悬浮球透明度", self._fix_input(self.lm_ball_alpha_sp),
-            "数值越大球越不透明。"), 2, 1)
+            "填写 #rrggbb 或点击取色即自定义，自定义色优先级最高。")
+        style_body = QWidget()
+        style_lay = QVBoxLayout(style_body)
+        style_lay.setContentsMargins(0, 0, 0, 0)
+        self._compact_grid(style_lay, [
+            self._param_card("卡片底色", self.lm_card_color_btn,
+                             "整卡唯一颜色，点击取色。"),
+            self._param_card("卡片透明度", alpha_wrap,
+                             "0 % 全透明，100 % 完全不透明；可输入「100%」或「60」。"
+                             "越界或非法会给出提示并自动修正。"),
+            line_card,
+            self._param_card("时间窗口", self._fix_input(self.lm_window_sec_sp),
+                             "曲线显示最近多少秒；与弹窗顶部滑块同步。"),
+        ], "liveMonitorStyleGrid", dense=True)
+        ball_body = QWidget()
+        ball_lay = QVBoxLayout(ball_body)
+        ball_lay.setContentsMargins(0, 0, 0, 0)
+        self._compact_grid(ball_lay, [
+            self._param_card("悬浮球大小", self._fix_input(self.lm_ball_size_sp),
+                             "悬浮球直径像素。"),
+            self._param_card("悬浮球透明度", self._fix_input(self.lm_ball_alpha_sp),
+                             "数值越大球越不透明。"),
+        ], "liveMonitorBallGrid", dense=True)
 
-        # —— 悬浮球位置：角吸附偏好 + 找回入口 ——
+        # —— 悬浮球与桌宠：角吸附偏好 + 形象切换 + 找回入口（原位构建，
+        #    不再事后 insertWidget 挤入；整改计划 F-05）——
         pos_row = QWidget()
         pr = QHBoxLayout(pos_row)
         pr.setContentsMargins(0, 0, 0, 0)
@@ -1665,16 +1694,30 @@ class SettingsDialog(QDialog):
             cfg.get("ball_corner", "bottom_right"))
         if corner_idx >= 0:
             self.lm_corner_cmb.setCurrentIndex(corner_idx)
+        self.lm_style_cmb = QComboBox()
+        self.lm_style_cmb.addItem("🦖 测温恐龙", "dino")
+        self.lm_style_cmb.addItem("🚀 玻璃生态舱", "cabin")
+        style_idx = self.lm_style_cmb.findData(cfg.get("pet_style", "dino"))
+        self.lm_style_cmb.setCurrentIndex(max(0, style_idx))
+        self.lm_style_cmb.setToolTip(
+            "悬浮球桌宠形象：生态舱自带均衡器液柱、逼近报警线呼吸、超温喷火"
+            "与恢复庆祝动画；液柱建议球径 ≥ 88px 看完整效果。切换立即生效")
+        self.lm_style_cmb.currentIndexChanged.connect(self._on_lm_value_changed)
+        self.lm_style_cmb.currentIndexChanged.connect(
+            lambda _i: self._lm_sync_cabin_visible())
         self.lm_restore_btn = QPushButton("恢复默认位置")
-        self.lm_restore_btn.setToolTip("悬浮球回到屏幕右下角并转为吸附状态")
+        self.lm_restore_btn.setToolTip(
+            "悬浮球回到默认吸附位（屏幕右下角）并转为吸附状态")
         pr.addWidget(self.lm_corner_cmb)
+        pr.addWidget(self.lm_style_cmb)
         pr.addWidget(self.lm_restore_btn)
         pr.addStretch(1)
-        gl.addWidget(self._param_card(
-            "悬浮球位置", pos_row,
+        pos_card = self._param_card("悬浮球位置", pos_row, "")
+        pos_card.setToolTip(
             "选择后悬浮球立即吸附到该位置并记住偏好（屏幕居中=球心对正屏幕工作区正中）；"
             "拖动球可在整个桌面自由放置（松手落在位置吸附区内自动吸附），球面始终不会"
-            "越出屏幕工作区，防止被拖到屏幕外疏漏。"), 3, 0, 1, 2)
+            "越出屏幕工作区，防止被拖到屏幕外疏漏。")
+        ball_lay.addWidget(pos_card)
 
         # —— 悬浮球球心最高温直显（实时采集时）——
         temp_row = QWidget()
@@ -1692,10 +1735,11 @@ class SettingsDialog(QDialog):
         tr.addWidget(self.lm_ball_warn_pct_sp)
         tr.addWidget(QLabel("接近上限即警示"))
         tr.addStretch(1)
-        gl.addWidget(self._param_card(
-            "球心最高温度", temp_row,
+        temp_card = self._param_card("球心最高温度", temp_row, "")
+        temp_card.setToolTip(
             "实时采集时在球心以数字显示当前所有可见通道的最高温度：达到上限变红、"
-            "达到阈值百分比变琥珀（上限默认跟随报警设置，重启沿用）。"), 4, 0, 1, 2)
+            "达到阈值百分比变琥珀（上限默认跟随报警设置，重启沿用）。")
+        ball_lay.addWidget(temp_card)
 
         # —— 全通道悬浮面板（独立第三块悬浮显示，与球/趋势弹窗互不依附）——
         panel_row = QWidget()
@@ -1725,28 +1769,14 @@ class SettingsDialog(QDialog):
         pnl.addWidget(self.lm_panel_alpha_sp)
         pnl.addWidget(QLabel("面板不透明度"))
         pnl.addStretch(1)
-        gl.addWidget(self._param_card(
-            "全通道面板", panel_row,
+        panel_row.setToolTip(
             "实时采集时在桌面显示独立面板，逐通道一行「名称+温度+进度条」（进度条"
             "按报警上限表达余量，超温红/接近橙，无效通道显示 --）；卡片皮肤深浅"
             "两套手动选、不随场景主题变化；可拖拽、位置自动记忆，停止采集或查看"
-            "历史文件时自动隐藏。"), 5, 0, 1, 2)
+            "历史文件时自动隐藏。")
 
-        # —— 桌宠形象切换（dino|cabin）：下拉并入「悬浮球位置」行（零行高
-        #    增量，保持悬浮监控页「无纵向滚动条」验收）；生态舱参数独立卡，
-        #    dino 态整卡隐藏不占高 ——
-        self.lm_style_cmb = QComboBox()
-        self.lm_style_cmb.addItem("🦖 测温恐龙", "dino")
-        self.lm_style_cmb.addItem("🚀 玻璃生态舱", "cabin")
-        style_idx = self.lm_style_cmb.findData(cfg.get("pet_style", "dino"))
-        self.lm_style_cmb.setCurrentIndex(max(0, style_idx))
-        self.lm_style_cmb.setToolTip(
-            "悬浮球桌宠形象：生态舱自带均衡器液柱、逼近报警线呼吸、超温喷火"
-            "与恢复庆祝动画；液柱建议球径 ≥ 88px 看完整效果。切换立即生效")
-        self.lm_style_cmb.currentIndexChanged.connect(self._on_lm_value_changed)
-        self.lm_style_cmb.currentIndexChanged.connect(
-            lambda _i: self._lm_sync_cabin_visible())
-        pr.insertWidget(pr.count() - 1, self.lm_style_cmb)
+        # —— 生态舱参数（形象切换下拉已原位并入悬浮球位置行；dino 态整卡
+        #    隐藏不占高，保「无纵向滚动条」验收）——
         self.lm_cabin_fluct_sp = QDoubleSpinBox()
         self.lm_cabin_fluct_sp.setRange(0.0, 20.0)
         self.lm_cabin_fluct_sp.setSingleStep(0.5)
@@ -1800,18 +1830,27 @@ class SettingsDialog(QDialog):
             self.lm_cabin_thr_cb.append(cb)
             self.lm_cabin_thr_sp.append(sp)
         wcl.addLayout(thr_grid)
-        self.lm_cabin_card = self._param_card(
-            "生态舱参数", self.lm_cabin_wrap, "")
-        gl.addWidget(self.lm_cabin_card, 6, 0, 1, 2)
+        self.lm_cabin_card = self._section_card(
+            "生态舱参数", self.lm_cabin_wrap, "", dense=True)
         self._lm_sync_cabin_visible()
 
-        card = self._section_card(
-            "监控悬浮卡外观", grid,
-            "文字/网格按卡片底色亮度自动配深浅；温度轴与时间轴刻度间隔随数据范围"
-            "自适应，刻度线按文字色绘制以保证深浅主题下均有对比度。"
-            "弹窗贴附悬浮球，拖动/缩放不影响这些设置。")
-        card.setObjectName("liveMonitorSection")
-        lay.addWidget(card)
+        style_section = self._section_card(
+            "监控悬浮卡外观", style_body,
+            "文字/网格按卡片底色亮度自动配深浅；弹窗贴附悬浮球，"
+            "拖动/缩放不影响这些设置。", dense=True)
+        style_section.setObjectName("liveMonitorSection")
+        ball_section = self._section_card(
+            "悬浮球与桌宠", ball_body,
+            "位置吸附与形象切换即时生效；详细规则见各卡悬停提示。",
+            dense=True)
+        panel_section = self._section_card(
+            "全通道面板", panel_row,
+            "逐通道「名称+温度+进度条」；深浅皮肤手动选，停止采集或查看"
+            "历史时自动隐藏；详见悬停提示。", dense=True)
+        lay.addWidget(style_section)
+        lay.addWidget(ball_section)
+        lay.addWidget(panel_section)
+        lay.addWidget(self.lm_cabin_card)
 
         self.lm_card_color_btn.clicked.connect(self._on_lm_pick_card_color)
         self.lm_line_color_btn.clicked.connect(self._on_lm_pick_line_color)
@@ -1867,8 +1906,8 @@ class SettingsDialog(QDialog):
             ball.bring_back_to(corner)
 
     def _on_lm_restore_position(self):
-        """恢复默认位置：球回屏幕右下角并转吸附状态。"""
-        corner = "bottom_right"
+        """恢复默认位置：球回默认吸附角（右下角）并转吸附状态。"""
+        corner = LIVE_MONITOR_DEFAULTS["ball_corner"]
         idx = self.lm_corner_cmb.findData(corner)
         if idx >= 0:
             self.lm_corner_cmb.setCurrentIndex(idx)
@@ -2093,15 +2132,14 @@ class SettingsDialog(QDialog):
             "斜率衰减灵敏度", self._fix_input(self.rise_slope_decay),
             "控制快速升温转为缓慢升温的相对斜率衰减程度，范围 0.10～0.90。数值越大，转折判定越严格。")
 
-        threshold_section = QWidget()
-        threshold_section.setObjectName("statisticsThresholdSection")
-        threshold_section.setMinimumWidth(0)
-        threshold_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        threshold_layout = QVBoxLayout(threshold_section)
+        threshold_body = QWidget()
+        threshold_layout = QVBoxLayout(threshold_body)
         threshold_layout.setContentsMargins(0, 0, 0, 0)
         self._compact_grid(
             threshold_layout, [filter_card, steady_card, decay_card],
             "statCompactGrid")
+        threshold_section = self._section_card("温升判定阈值", threshold_body, "")
+        threshold_section.setObjectName("statisticsThresholdSection")
         lay.addWidget(threshold_section)
 
         lay.addStretch(1)
@@ -2123,9 +2161,9 @@ class SettingsDialog(QDialog):
         self.alm_enabled.setChecked(cfg.enabled)
         enabled_card = self._param_card(
             "报警总开关", self.alm_enabled,
-            "关闭后实时采集不进行任何判定与动作。")
+            "关闭后实时采集不进行任何判定与动作。", dense=True)
         lay.addWidget(self._section_card(
-            "启用", enabled_card, "总开关关闭时所有动作均不执行。"))
+            "启用", enabled_card, "总开关关闭时所有动作均不执行。", dense=True))
 
         # 阈值（全局统一）
         def _spin(lo, hi, val, step=1.0, dec=1):
@@ -2149,19 +2187,19 @@ class SettingsDialog(QDialog):
         follow_card = self._param_card(
             "上限跟随温度轴", self.alm_follow_axis,
             "开启后报警上限自动 = 温度轴基础窗口上限 − 偏移（例：轴上限 40 → 报警 38）；"
-            "关闭后可在上方手动输入。")
+            "图表轴自动扩展不改变报警上限。关闭后可在上方手动输入。", dense=True)
         offset_card = self._param_card(
             "跟随偏移（℃）", self._fix_input(self.alm_follow_offset),
-            "报警上限相对温度轴基础窗口上限的下调量。")
+            "报警上限相对温度轴基础窗口上限的下调量。", dense=True)
         high_card = self._param_card(
             "温度上限（℃）", self._fix_input(self.alm_high),
-            "超过此值触发超上限报警。")
+            "超过此值触发超上限报警。", dense=True)
         rate_card = self._param_card(
             "变化率阈值（℃/秒）", self._fix_input(self.alm_rate),
-            "相邻采样点温度变化率超过此值触发报警。")
+            "相邻采样点温度变化率超过此值触发报警。", dense=True)
         diff_card = self._param_card(
             "通道间温差阈值（℃）", self._fix_input(self.alm_diff),
-            "同一帧有效通道最大与最小之差超过此值触发报警。")
+            "同一帧有效通道最大与最小之差超过此值触发报警。", dense=True)
 
         def _sync_follow_ui():
             follow = self.alm_follow_axis.isChecked()
@@ -2180,10 +2218,11 @@ class SettingsDialog(QDialog):
         thr_lay.setContentsMargins(0, 0, 0, 0)
         self._compact_grid(
             thr_lay, [follow_card, offset_card, high_card, rate_card, diff_card],
-            "alarmThresholdGrid")
+            "alarmThresholdGrid", dense=True)
         lay.addWidget(self._section_card(
             "阈值（全局统一）", thr_section,
-            "所有通道共用同一组阈值；跟随温度轴时上限自动计算、无需手填。"))
+            "所有通道共用同一组阈值；跟随温度轴时上限自动计算、无需手填。",
+            dense=True))
 
         # 动作开关
         def _toggle(val):
@@ -2206,14 +2245,15 @@ class SettingsDialog(QDialog):
         act_lay.setContentsMargins(0, 0, 0, 0)
         # 动作开关用无说明的紧凑卡片两列排布，说明移入悬停提示，节省纵向高度
         self._compact_grid(act_lay, [
-            self._param_card("界面高亮", self.alm_act_highlight, ""),
-            self._param_card("声音提示", self.alm_act_sound, ""),
-            self._param_card("弹窗提示", self.alm_act_popup, ""),
-            self._param_card("写入历史", self.alm_act_log, ""),
-            self._param_card("串口输出", self.alm_act_serial, ""),
-        ], "alarmActionGrid")
+            self._param_card("界面高亮", self.alm_act_highlight, "", dense=True),
+            self._param_card("声音提示", self.alm_act_sound, "", dense=True),
+            self._param_card("弹窗提示", self.alm_act_popup, "", dense=True),
+            self._param_card("写入历史", self.alm_act_log, "", dense=True),
+            self._param_card("串口输出", self.alm_act_serial, "", dense=True),
+        ], "alarmActionGrid", dense=True)
         lay.addWidget(self._section_card(
-            "报警动作", act_section, "可独立开关；各项说明见悬停提示。"))
+            "报警动作", act_section, "可独立开关；各项说明见悬停提示。",
+            dense=True))
 
         # Modbus 串口参数
         self.alm_serial_port = QComboBox()
@@ -2233,31 +2273,31 @@ class SettingsDialog(QDialog):
             self.alm_serial_port.setCurrentText(cfg.serial_port)
         port_card = self._param_card(
             "报警输出串口", self.alm_serial_port,
-            "独立于采集串口；留空则不输出。")
+            "独立于采集串口；留空则不输出。", dense=True)
         self.alm_serial_baud = QSpinBox()
         self.alm_serial_baud.setRange(1, 115200)
         self.alm_serial_baud.setValue(int(cfg.serial_baud))
-        baud_card = self._param_card("波特率", self.alm_serial_baud, "")
+        baud_card = self._param_card("波特率", self.alm_serial_baud, "", dense=True)
         self.alm_modbus_slave = QSpinBox()
         self.alm_modbus_slave.setRange(1, 247)
         self.alm_modbus_slave.setValue(int(cfg.modbus_slave))
         slave_card = self._param_card(
-            "Modbus 从站地址", self.alm_modbus_slave, "范围 1-247。")
+            "Modbus 从站地址", self.alm_modbus_slave, "范围 1-247。", dense=True)
         self.alm_modbus_coil = QSpinBox()
         self.alm_modbus_coil.setRange(0, 65535)
         self.alm_modbus_coil.setValue(int(cfg.modbus_coil))
         coil_card = self._param_card(
             "Modbus 线圈地址", self.alm_modbus_coil,
-            "写单个线圈触发 / 解除报警。")
+            "写单个线圈触发 / 解除报警。", dense=True)
         ser_section = QWidget()
         ser_lay = QVBoxLayout(ser_section)
         ser_lay.setContentsMargins(0, 0, 0, 0)
         self._compact_grid(
             ser_lay, [port_card, baud_card, slave_card, coil_card],
-            "alarmSerialGrid")
+            "alarmSerialGrid", dense=True)
         lay.addWidget(self._section_card(
             "Modbus 串口输出", ser_section,
-            "仅当「串口输出」开启且选定端口时生效。"))
+            "仅当「串口输出」开启且选定端口时生效。", dense=True))
 
         lay.addStretch(1)
         self.stack.addWidget(page)
@@ -2304,9 +2344,11 @@ class SettingsDialog(QDialog):
         lay.addWidget(a4_grid)
 
         self.a4_chk_mark = ToggleSwitch("启用"); self.a4_chk_mark.setChecked(self.parent.a4_mark)
-        lay.addWidget(self._param_card(
+        # 尾部悬空裸卡并入同级标题分区，与两张时间段卡层级对齐（整改计划 F-02）
+        mark_card = self._param_card(
             "在曲线上标注各通道进入平稳的时间线", self.a4_chk_mark,
-            "在曲线上用虚线标出各通道进入平稳期的时刻。"))
+            "在曲线上用虚线标出各通道进入平稳期的时刻。")
+        lay.addWidget(self._section_card("平稳期标注", mark_card, ""))
 
     # ----------------------------------------------------- 界面主题切换
     def _on_theme_changed(self, idx):

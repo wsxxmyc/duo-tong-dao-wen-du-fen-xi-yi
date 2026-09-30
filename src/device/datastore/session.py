@@ -114,6 +114,12 @@ class Session:
 
     def is_open_circuit(self, ch: Union[Channel, int]) -> bool:
         """通道是否开路 / 无数据（全 NaN）。"""
+        if self.is_live:
+            # live 会话：append_frame/append_bulk 已增量维护 last_value，
+            # 从未出现有限值 ⇔ 整列全 NaN，O(1) 判定替代整列 isnan 扫描
+            c = (ch if isinstance(ch, Channel)
+                 else self.channel_by_index(int(ch)))
+            return getattr(c, "last_value", None) is None
         col = self.values(ch)
         return col.size == 0 or bool(np.all(np.isnan(col)))
 

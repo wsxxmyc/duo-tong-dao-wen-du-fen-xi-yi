@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-core.py —— 多通道温度分析仪 数据核心层
+core.py —— 温度爬升分析工具 数据核心层
 职责：文件加载（编码/分隔符自适应、开路识别）、异常检测（3 算法）、
       邻域均值填充、平滑、重采样、时间轴重标定、统计分析。
 不依赖任何 UI，可单独测试。
@@ -458,6 +458,12 @@ class AlarmConfig:
     follow_offset: float = 2.0     # 跟随偏移：报警上限 = 轴基础上限 - 该值
     rate_threshold: float = 10.0   # 变化率阈值（℃/s）
     diff_threshold: float = 20.0   # 通道间温差阈值（℃）
+    # 恢复滞回（2026-09-23 报警风暴整改 P0-1，见整改计划 §4 P0-1）：
+    # 上限恢复需 v ≤ temp_high - clear_margin，且恢复态保持达 clear_hold_sec
+    # 才发 cleared；clear_margin=0 且 clear_hold_sec=0 时上限恢复语义与旧版一致
+    # （变化率/温差恢复带宽为固定工业惯例，见 ALARM_RATE_CLEAR_FACTOR 等常量）
+    clear_margin: float = 1.0      # 上限恢复滞回带（℃）
+    clear_hold_sec: float = 3.0    # 恢复保持时长（秒），0=立即恢复
     # 各动作开关
     act_highlight: bool = True
     act_sound: bool = True
@@ -506,6 +512,8 @@ class AlarmConfig:
             modbus_slave=_int(self.modbus_slave, 1, 1, 247),
             modbus_coil=_int(self.modbus_coil, 0, 0, 65535),
             sound_file=str(self.sound_file or ""),
+            clear_margin=min(max(_float(self.clear_margin, 1.0), 0.0), 50.0),
+            clear_hold_sec=min(max(_float(self.clear_hold_sec, 3.0), 0.0), 60.0),
         )
 
 
@@ -515,6 +523,61 @@ class AlarmConfig:
 ALARM_HIGH = "high"
 ALARM_RATE = "rate"
 ALARM_DIFF = "diff"
+
+# 恢复滞回固定带宽（变化率/温差，与 cfg.clear_margin 独立）
+ALARM_RATE_CLEAR_FACTOR = 0.7    # 变化率恢复需 rate ≤ threshold × 0.7
+ALARM_DIFF_CLEAR_MARGIN_C = 2.0  # 温差恢复需 diff ≤ threshold - 2.0℃
+
+# 报警状态机相位
+ALARM_PHASE_NORMAL = "normal"
+ALARM_PHASE_ACTIVE = "active"
+ALARM_PHASE_CLEARING = "clearing"   # 已越出滞回带、保持时长未满（对外仍视为报警中）
+
+
+def alarm_phase(state):
+    """states 值 → 相位字符串。值形态："normal"|"active"|("clearing", since_ts)。"""
+    if isinstance(state, tuple):
+        return state[0]
+    return state or ALARM_PHASE_NORMAL
+
+
+def alarm_clear_since(state):
+    """clearing 相位的恢复起点时间戳；非 clearing 返回 None。"""
+    return state[1] if isinstance(state, tuple) else None
+
+
+def alarm_active(state):
+    """该状态是否仍属"报警中"（active 或 clearing，对外语义一致）。"""
+    return alarm_phase(state) != ALARM_PHASE_NORMAL
+
+
+def _recovery_satisfied(key, values, prev_map, timestamp, cfg, valid_set):
+    """active/clearing 态的恢复条件（含滞回带）是否满足（纯判定）。
+
+    无法计算的指标（无上一有效点、有效通道不足）沿用旧语义视为"不违规=恢复"。
+    """
+    ch_idx, atype = key
+    if atype == ALARM_HIGH:
+        v = values[ch_idx]
+        return v is not None and v <= cfg.temp_high - cfg.clear_margin
+    if atype == ALARM_RATE:
+        v = values[ch_idx]
+        prev = prev_map.get(ch_idx)
+        if v is None or prev is None:
+            return True
+        dt = timestamp - prev[0]
+        if dt <= 0:
+            return True
+        rate = abs(v - prev[1]) / dt
+        return rate <= cfg.rate_threshold * ALARM_RATE_CLEAR_FACTOR
+    # ALARM_DIFF（帧级）
+    if len(valid_set) < 2:
+        return True
+    valid_vals = [values[i] for i in valid_set if values[i] is not None]
+    if len(valid_vals) < 2:
+        return True
+    return (max(valid_vals) - min(valid_vals)
+            <= cfg.diff_threshold - ALARM_DIFF_CLEAR_MARGIN_C)
 
 
 def evaluate_channel_alarms(values, prev_map, timestamp, cfg):
@@ -562,24 +625,31 @@ def evaluate_channel_alarms(values, prev_map, timestamp, cfg):
 
 
 def step_alarm(values, prev_map, states, timestamp, cfg):
-    """单帧报警判定 + 锁定状态机推进（纯函数，无 UI）。
+    """单帧报警判定 + 三态锁定状态机推进（纯函数，无 UI）。
 
-    状态机：每 ``(channel_idx|None, alarm_type)`` 独立维护 ``normal`` / ``active``。
+    状态机：每 ``(channel_idx|None, alarm_type)`` 独立维护
+    ``normal`` / ``active`` / ``("clearing", 恢复起点)``。
 
     - normal 且本帧违规 → active（产生 active 事件）
-    - active 且本帧违规 → 锁定，不重复产生事件
-    - active 且本帧恢复 → normal（产生 cleared 事件）
+    - active 且本帧违规 → 保持 active（不重复发事件）
+    - clearing 且本帧违规 → 回到 active（恢复计时清零，产生 retrigger 事件：
+      确认已解除后重新提醒；频率上界=恢复尝试次数，被滞回+hold 钳制）
+    - active 且本帧不违规但仍处滞回带内 → 保持 active（消灭临界抖动）
+    - 越出滞回带 → clearing；恢复条件连续保持达 ``clear_hold_sec`` →
+      normal（产生 cleared 事件）。clearing 对外语义仍算报警中
+      （消费方用 :func:`alarm_phase` 判 ``in ("active","clearing")``）。
 
     无效通道（None）的通道级报警保持原状态、不产生事件；温差（帧级）在
-    有效通道不足 2 个时视为恢复（详见 design §4.4、§10）。
+    有效通道不足 2 个时视为恢复候选（同样受滞回保持时长约束，
+    详见 design §4.4、§10 与整改计划 §4 P0-1）。
 
     Args:
         values, prev_map, timestamp, cfg: 同 :func:`evaluate_channel_alarms`。
-        states: ``{(channel_idx|None, alarm_type): "normal"|"active"}`` 当前状态。
+        states: ``{key: "normal"|"active"|("clearing", ts)}`` 当前状态。
 
     Returns:
         ``(events, new_prev_map, new_states)``：
-          - events: ``[(channel_idx|None, alarm_type, "active"|"cleared", actual_value)]``
+          - events: ``[(channel_idx|None, alarm_type, "active"|"retrigger"|"cleared", actual_value)]``
           - new_prev_map / new_states：更新后的副本（不原地修改入参）
     """
     if not cfg.enabled:
@@ -593,13 +663,37 @@ def step_alarm(values, prev_map, states, timestamp, cfg):
         # 通道级报警：本帧该通道无效则保持原状态，不产生事件
         if ch_idx is not None and ch_idx not in valid_set:
             continue
-        prev_state = new_states.get(key, "normal")
-        is_violating = key in violations
-        if prev_state == "normal" and is_violating:
-            new_states[key] = "active"
-            events.append((ch_idx, atype, "active", violations[key]))
-        elif prev_state == "active" and not is_violating:
-            new_states[key] = "normal"
+        state = new_states.get(key, ALARM_PHASE_NORMAL)
+        phase = alarm_phase(state)
+        if key in violations:
+            if phase == ALARM_PHASE_NORMAL:
+                new_states[key] = ALARM_PHASE_ACTIVE
+                events.append((ch_idx, atype, "active", violations[key]))
+            else:
+                # 违规复现：恢复计时作废，锁回 active。clearing 期复现是一次
+                # 真实「恢复失败」→ 发 retrigger（GUI 撤销确认后重新提醒，
+                # 整改 Q2-2）；active 期复现不发事件，维持风暴抑制。
+                new_states[key] = ALARM_PHASE_ACTIVE
+                if phase == ALARM_PHASE_CLEARING:
+                    events.append((ch_idx, atype, "retrigger",
+                                   violations[key]))
+            continue
+        if phase == ALARM_PHASE_NORMAL:
+            continue
+        if not _recovery_satisfied(
+                key, values, prev_map, timestamp, cfg, valid_set):
+            # 滞回带内：恢复未确认；clearing 被打断则退回 active
+            new_states[key] = ALARM_PHASE_ACTIVE
+            continue
+        hold = getattr(cfg, "clear_hold_sec", 0.0)
+        since = alarm_clear_since(state)
+        if hold <= 0.0:
+            new_states[key] = ALARM_PHASE_NORMAL
+            events.append((ch_idx, atype, "cleared", 0.0))
+        elif since is None:
+            new_states[key] = (ALARM_PHASE_CLEARING, timestamp)
+        elif timestamp - since >= hold:
+            new_states[key] = ALARM_PHASE_NORMAL
             events.append((ch_idx, atype, "cleared", 0.0))
     return events, new_prev, new_states
 

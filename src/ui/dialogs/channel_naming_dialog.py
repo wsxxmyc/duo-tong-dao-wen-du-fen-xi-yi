@@ -319,6 +319,17 @@ class ChannelNamingDialog(QDialog):
         bh.addWidget(self.btn_delete_name)
         bh.addStretch(1)
         right.addWidget(btns)
+
+        # 名称独立文件手动重载入口：文件改动通常由 ConfigWatcher 自动生效，
+        # 此按钮用于自动监听失效（如个别系统事件丢失）时的兜底
+        self.btn_reload_names = QPushButton("📄 从文件重载")
+        self.btn_reload_names.setObjectName("poolBtn")
+        self.btn_reload_names.setToolTip(
+            "重新读取 用户数据/config/通道名称-channel-names.json 并应用。\n"
+            "该文件用文本编辑器修改保存后会自动生效，此按钮为手动兜底。")
+        self.btn_reload_names.clicked.connect(
+            lambda: self.mw._apply_channel_names_from_file())
+        right.addWidget(self.btn_reload_names)
         columns.addWidget(pane_pool)
 
         lay.addLayout(columns)

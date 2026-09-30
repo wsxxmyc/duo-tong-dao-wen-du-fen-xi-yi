@@ -48,23 +48,24 @@ LIVE_WINDOW_MIN_DEFAULT = 2
 
 # 主图实时窗口的新配置契约：持久化单位为秒。
 LIVE_WINDOW_SEC_CHOICES = (12, 24, 36, 48, 60)
+# 默认档 2026-09-11 由 60 收紧为 24：双区图右区实时窗在 24 秒下细节更可读（用户拍板）。
 LIVE_WINDOW_SEC_DEFAULT = 24
 
 # 监控悬浮卡外观配置契约：唯一底色调 card_color（边框/卡体/顶栏/画布 band 由其派生分层）、
 # 整卡不透明度 card_alpha（0~1 全区间，见 CARD_ALPHA_MIN/MAX）、趋势线/填充色 line_color
 # （空串=跟随主题强调色，非空=自定义优先）、悬浮球与时间窗口；
-# 位置状态契约：ball_mode（docked 吸附位 / free 自由）、ball_corner（吸附位 bottom_right 右下角/
-# top_right 右上角/top_left 左上角/center 画布正中，供 docked 态与启动恢复，默认右下角）、
+# 位置状态契约：ball_mode（docked 吸附位 / free 自由）、ball_corner（吸附位 center 画布正中/
+# top_right 右上角/top_left 左上角/bottom_right 右下角，供 docked 态与启动恢复）、
 # ball_pos_x/y（free 态球左上角全局坐标，启动越界时自动回默认吸附位）。
 LIVE_MONITOR_DEFAULTS = {
     "card_color": "#e8ecef",    # 悬浮卡唯一底色调（边框/卡体/顶栏/画布 band 均由其派生分层）
-    "card_alpha": 1.0,          # 整卡不透明度（见 CARD_ALPHA_MIN/MAX，0=全透明，1=完全不透明）
+    "card_alpha": 1.0,          # 整卡不透明度（2026-09-11 默认改 100% 全不透明，用户拍板）
     "line_color": "",           # 趋势线/填充色；空串=跟随当前主题强调色 Theme.ACCENT
-    "ball_size": 100,           # 悬浮球（宠物恐龙）直径像素 40~120
+    "ball_size": 100,           # 悬浮球（宠物恐龙）直径像素 40~120（2026-09-11 默认改 100）
     "ball_alpha": 1.0,          # 悬浮球不透明度 0.40~1.00
-    "window_sec": 16,           # 弹窗时间窗口秒数 5~120（顶部滑动条可调）
+    "window_sec": 16,           # 弹窗时间窗口秒数 5~120（顶部滑动条可调；默认 16s 用户拍板）
     "ball_mode": "docked",      # 悬浮球位置状态：docked=吸附宿主可视区位置预设，free=用户自由放置
-    "ball_corner": "bottom_right",  # 吸附位偏好：bottom_right（默认，右下角）| top_right | top_left | center
+    "ball_corner": "bottom_right",  # 吸附位偏好：bottom_right（默认，屏幕右下角，2026-09-11 起）| center | top_right | top_left
     "ball_pos_x": 0,            # free 态保存的球左上角全局 X（docked 态忽略）
     "ball_pos_y": 0,            # free 态保存的球左上角全局 Y（docked 态忽略）
     "ball_show_max_temp": True, # 球心显示可见通道最高温（数值直显，实时采集生效）
@@ -225,7 +226,8 @@ def _normalize_live_monitor_config(config):
         if cfg["ball_mode"] not in ("docked", "free"):
             cfg["ball_mode"] = LIVE_MONITOR_DEFAULTS["ball_mode"]
         cfg["ball_corner"] = config.get("ball_corner")
-        if cfg["ball_corner"] not in ("top_right", "top_left", "bottom_right", "center"):
+        if cfg["ball_corner"] not in ("bottom_right", "top_right",
+                                      "top_left", "center"):
             cfg["ball_corner"] = LIVE_MONITOR_DEFAULTS["ball_corner"]
         cfg["ball_pos_x"] = int(_clamp_float(
             config.get("ball_pos_x"), -40000, 40000,
@@ -612,6 +614,8 @@ class ConfigIO:
                 modbus_slave=cfg.get("modbus_slave", 1),
                 modbus_coil=cfg.get("modbus_coil", 0),
                 sound_file=cfg.get("sound_file", ""),
+                clear_margin=cfg.get("clear_margin", 1.0),
+                clear_hold_sec=cfg.get("clear_hold_sec", 3.0),
             ).normalized()
         except Exception as e:
             print(f"[CONFIG] 配置操作异常: {e}", flush=True)
@@ -640,6 +644,8 @@ class ConfigIO:
                 "modbus_slave": config.modbus_slave,
                 "modbus_coil": config.modbus_coil,
                 "sound_file": config.sound_file,
+                "clear_margin": config.clear_margin,
+                "clear_hold_sec": config.clear_hold_sec,
             })
         except Exception as e:
             print(f"[CONFIG] 配置操作异常: {e}", flush=True)
@@ -693,7 +699,7 @@ class ConfigIO:
             "ax_temp_hi_factor": 1.30,
             "ax_live_window_sec": LIVE_WINDOW_SEC_DEFAULT,
             "ax_live_window_min": LIVE_WINDOW_MIN_DEFAULT,
-            "ax_dual_view_enabled": False,
+            "ax_dual_view_enabled": False,  # 2026-09-11 默认改不启动双区图（用户拍板）
         }
         try:
             cfg = ConfigIO.load_section("axis", {}, (AXIS_CONFIG_FILE,))
@@ -810,7 +816,7 @@ class ConfigIO:
                 "temp_lo_factor": main_window.ax_temp_lo_factor,
                 "temp_hi_factor": main_window.ax_temp_hi_factor,
                 "dual_view_enabled": getattr(
-                    main_window, "ax_dual_view_enabled", False),
+                    main_window, "ax_dual_view_enabled", True),
                 "live_window_sec": live_window_sec,
             })
             # 旧键只允许作为读取迁移输入，不能继续写回统一配置。

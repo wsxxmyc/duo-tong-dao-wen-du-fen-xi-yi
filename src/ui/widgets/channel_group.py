@@ -218,6 +218,10 @@ class ChannelGroup(QWidget):
 
     def has_data(self, s) -> bool:
         """本组是否有有效数据（任一通道非全 NaN）。"""
+        if getattr(s, "is_live", False):
+            # live 会话增量元数据判定（O(通道数)）：任一通道出现过有限值
+            # 即非全 NaN，替代逐列 isfinite 全量扫描（FA-PERF-1 配套）
+            return any(c.last_value is not None for c in self.channels)
         for c in self.channels:
             col = s.buffer.column(c.index)
             if col.size and np.isfinite(col).any():

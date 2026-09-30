@@ -51,6 +51,9 @@ def _nice_step(span, target_ticks=6):
     import math
     if span <= 0:
         return 1.0
+    # 次正规下溢防护：span/target_ticks 次正规化或下溢为 0 时，
+    # log10 与下游 ceil(x/step) 会抛 ValueError/OverflowError
+    span = max(span, 1e-12)
     raw = span / max(target_ticks, 1)
     mag = 10 ** math.floor(math.log10(raw))
     norm = raw / mag

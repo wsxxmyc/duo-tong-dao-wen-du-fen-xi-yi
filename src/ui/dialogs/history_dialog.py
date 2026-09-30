@@ -129,6 +129,35 @@ def count_external_sessions(source_path: str) -> int:
         src.close()
 
 
+class _ScanOldDbWorker(QThread):
+    """后台整盘扫描旧版本包数据库（按目录特征点比对，带剪枝，秒级）。
+
+    扫描器为纯函数（utils/old_db_scanner），这里只做线程包装与中止：
+    abort() 置标记，扫描器逐目录检查后尽快返回已收集结果。
+    """
+    progress = pyqtSignal(str)      # 当前扫描目录（节流后）
+    done = pyqtSignal(object)       # 有效候选列表（scan_with_probe 结果）
+    failed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._abort = False
+
+    def abort(self):
+        """请求中止扫描（线程安全，仅置标记）。"""
+        self._abort = True
+
+    def run(self):
+        try:
+            from utils import old_db_scanner
+            result = old_db_scanner.scan_with_probe(
+                should_abort=lambda: self._abort,
+                progress_cb=lambda path: self.progress.emit(path))
+            self.done.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class HistoryDialog(QDialog):
     """数据对话框（三标签：本机数据 / 远程数据 / 服务 + 打开文件角标按钮）"""
 
@@ -138,6 +167,9 @@ class HistoryDialog(QDialog):
 
     # 请求主窗口打开温度数据文件（角标「📂 打开文件」按钮）
     open_file_requested = pyqtSignal()
+
+    # 请求主窗口打开跨会话通道对比窗口（角标「📊 跨会话对比」按钮）
+    cross_compare_requested = pyqtSignal()
 
     # 服务状态变更（转发自服务页；主窗口据此同步状态栏/标题/远程页互斥）
     service_changed = pyqtSignal()
@@ -219,12 +251,22 @@ class HistoryDialog(QDialog):
         self._btn_open_file.setText("📂 打开文件")
         self._btn_open_file.setToolTip("打开 / 导入温度数据文件 (Ctrl+O)")
         self._btn_open_file.clicked.connect(self.open_file_requested)
+
+        # 角标按钮「📊 跨会话对比」：多会话同通道曲线同图对比的入口
+        # （对比窗口独立非模态，选会话/通道在其内完成，与本弹窗互不干扰）
+        self._btn_cross_compare = QToolButton()
+        self._btn_cross_compare.setObjectName("historyCrossCompareButton")
+        self._btn_cross_compare.setText("📊 跨会话对比")
+        self._btn_cross_compare.setToolTip(
+            "跨会话通道对比：把多个历史会话的同一通道曲线放在一张图对比")
+        self._btn_cross_compare.clicked.connect(self.cross_compare_requested)
         # 角标按钮不直接贴在 QTabWidget 边框上；使用独立宿主保留
         # 四周留白，避免按钮左/右描边与标签页外框重合。
         corner_host = QWidget()
         corner_layout = QHBoxLayout(corner_host)
         corner_layout.setContentsMargins(6, 0, 8, 0)
-        corner_layout.setSpacing(0)
+        corner_layout.setSpacing(6)
+        corner_layout.addWidget(self._btn_cross_compare)
         corner_layout.addWidget(self._btn_open_file)
         self._corner_host = corner_host
         self._tabs.setCornerWidget(corner_host, Qt.TopRightCorner)
@@ -280,7 +322,7 @@ class HistoryDialog(QDialog):
         selection_bg = Theme.EMPHASIS_FILL
         face = Theme.table_face()
         if face:
-            # 浅灰工业深色部件：本机会话树整体深底白字，选中行实色深蓝白字
+            # 浅灰工业 深色部件：本机会话树整体深底白字，选中行实色深蓝白字
             self._tree.setStyleSheet(f"""
                 QTreeWidget {{
                     background: {face['base']};
@@ -369,7 +411,7 @@ class HistoryDialog(QDialog):
         if self._service_page is not None:
             self._service_page.refresh_theme()
         # 角标「打开文件」按钮与主工具栏按钮同款描边样式（局部固化，
-        # 必须随切主题重设，否则停留旧主题色）
+        # 必须随切主题重设，否则停留旧主题色）；「跨会话对比」同款
         self._btn_open_file.setStyleSheet(f"""
             QToolButton#historyOpenFileButton {{
                 background: {Theme.BG_INPUT};
@@ -379,6 +421,20 @@ class HistoryDialog(QDialog):
                 padding: 3px 12px;
             }}
             QToolButton#historyOpenFileButton:hover {{
+                background: {Theme.BG_HOVER};
+                border-color: {Theme.ACCENT};
+                color: {Theme.readable_text(Theme.ACCENT)};
+            }}
+        """)
+        self._btn_cross_compare.setStyleSheet(f"""
+            QToolButton#historyCrossCompareButton {{
+                background: {Theme.BG_INPUT};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 3px;
+                min-height: 0;
+                padding: 3px 12px;
+            }}
+            QToolButton#historyCrossCompareButton:hover {{
                 background: {Theme.BG_HOVER};
                 border-color: {Theme.ACCENT};
                 color: {Theme.readable_text(Theme.ACCENT)};
@@ -419,6 +475,13 @@ class HistoryDialog(QDialog):
             "把另一台设备的历史数据库合并进当前数据库（按会话 ID 去重，已存在的自动跳过）")
         self._btn_import_db.clicked.connect(self._import_external_db)
         tool_row.addWidget(self._btn_import_db)
+
+        self._btn_scan_old = QPushButton("扫描旧版本数据…")
+        self._btn_scan_old.setToolTip(
+            "按目录特征点扫描本机各磁盘的旧版本软件包数据库，"
+            "勾选后合并进当前数据库（跨版本升级找回历史数据）")
+        self._btn_scan_old.clicked.connect(self._scan_old_version_dbs)
+        tool_row.addWidget(self._btn_scan_old)
         layout.addLayout(tool_row)
 
         # 时间筛选行
@@ -699,6 +762,95 @@ class HistoryDialog(QDialog):
         QMessageBox.warning(self, "导入失败", msg)
 
     # ==================================================================
+    #  扫描旧版本数据（跨版本升级迁移，扫描器见 utils/old_db_scanner.py）
+    # ==================================================================
+    def _scan_old_version_dbs(self):
+        """后台扫描本机旧版本包数据库，扫完弹勾选框 → 选中即合并。"""
+        if getattr(self, "_scan_worker", None) is not None:
+            return  # 已在扫描
+        if self._history_db is None:
+            QMessageBox.warning(self, "无法迁移", "当前数据库不可用")
+            return
+        self._btn_scan_old.setEnabled(False)
+        self._lbl_status.setText("正在扫描本机磁盘旧版本数据…")
+        self._scan_worker = _ScanOldDbWorker(self)
+        self._scan_worker.done.connect(self._on_scan_old_done)
+        self._scan_worker.failed.connect(self._on_scan_old_failed)
+        self._scan_worker.finished.connect(
+            lambda: setattr(self, "_scan_worker", None))
+        self._scan_worker.finished.connect(self._scan_worker.deleteLater)
+        self._scan_worker.start()
+
+    def _on_scan_old_done(self, candidates):
+        self._btn_scan_old.setEnabled(True)
+        if not candidates:
+            self._lbl_status.setText("未发现旧版本数据库")
+            QMessageBox.information(
+                self, "扫描完成", "未在本机发现旧版本软件包的历史数据库。")
+            return
+        from ui.dialogs.old_db_migrate_dialog import OldDbMigrateDialog
+        dlg = OldDbMigrateDialog(candidates, self, title="扫描到旧版本数据库")
+        if dlg.exec_() != OldDbMigrateDialog.Accepted:
+            self._lbl_status.setText("已取消迁移")
+            return
+        selected = dlg.selected_candidates()
+        if not selected:
+            self._lbl_status.setText("未选择要迁移的数据库")
+            return
+        self._start_scan_import([c["db_path"] for c in selected])
+
+    def _on_scan_old_failed(self, msg: str):
+        self._btn_scan_old.setEnabled(True)
+        self._lbl_status.setText("扫描失败")
+        QMessageBox.warning(self, "扫描失败", msg)
+
+    def _start_scan_import(self, paths):
+        """串行合并选中的旧库进当前数据库；完成后统一汇总并刷新会话树。"""
+        self._scan_import_queue = list(paths)
+        self._scan_import_results = []
+        self._btn_scan_old.setEnabled(False)
+        self._btn_import_db.setEnabled(False)
+        self._import_next_scan_db()
+
+    def _import_next_scan_db(self):
+        if not self._scan_import_queue:
+            self._finish_scan_import()
+            return
+        path = self._scan_import_queue.pop(0)
+        remain = len(self._scan_import_queue) + 1
+        self._lbl_status.setText(f"正在合并旧版本数据库（剩 {remain} 个）…")
+        self._scan_import_worker = _ImportDBWorker(
+            self._history_db, path, self)
+        self._scan_import_worker.done.connect(self._on_scan_import_one_done)
+        self._scan_import_worker.failed.connect(
+            self._on_scan_import_one_failed)
+        self._scan_import_worker.finished.connect(
+            self._scan_import_worker.deleteLater)
+        self._scan_import_worker.start()
+
+    def _on_scan_import_one_done(self, imported, skipped, failed):
+        self._scan_import_results.append((imported, skipped, failed))
+        self._import_next_scan_db()
+
+    def _on_scan_import_one_failed(self, msg: str):
+        self._scan_import_results.append((0, 0, 0))
+        print(f"迁移旧版本库失败: {msg}", flush=True)
+        self._import_next_scan_db()
+
+    def _finish_scan_import(self):
+        self._btn_scan_old.setEnabled(True)
+        self._btn_import_db.setEnabled(True)
+        imp = sum(r[0] for r in self._scan_import_results)
+        skip = sum(r[1] for r in self._scan_import_results)
+        fail = sum(r[2] for r in self._scan_import_results)
+        self._lbl_status.setText("旧版本数据迁移完成")
+        QMessageBox.information(
+            self, "迁移完成",
+            f"新导入 {imp} 个会话，跳过 {skip} 个（已存在）"
+            + (f"，失败 {fail} 个。" if fail else "。"))
+        self._load_sessions()
+
+    # ==================================================================
     #  会话树
     # ==================================================================
     def _current_range(self):
@@ -783,7 +935,7 @@ class HistoryDialog(QDialog):
         回到 Theme.TEXT。只返回语义色列的话，曾被选中（全列强调色）的
         行取消选中后，非语义列前景停留在强调色，状态语义错乱。
         """
-        # 浅灰工业深色部件时补偿底色换会话树深行底（白字系），其余主题对卡底
+        # 浅灰工业 深色部件时补偿底色换会话树深行底（白字系），其余主题对卡底
         face = Theme.table_face()
         surface = face["base"] if face else None
         if selected:
@@ -1208,6 +1360,10 @@ class HistoryDialog(QDialog):
     def closeEvent(self, event) -> None:
         """关闭对话框时释放数据库连接、远程页线程与服务页定时器
         （远程连接保留不中断）。"""
+        scan_w = getattr(self, "_scan_worker", None)
+        if scan_w is not None and scan_w.isRunning():
+            scan_w.abort()
+            scan_w.wait(3000)
         if self._history_db is not None:
             try:
                 self._history_db.close()

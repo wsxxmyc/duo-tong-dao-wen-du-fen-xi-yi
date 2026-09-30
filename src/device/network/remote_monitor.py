@@ -108,7 +108,7 @@ class RemoteMonitor(QObject):
     依赖注入（避免 device/network 反向依赖 device/datastore）：
     store_mod 提供 load_session_from_remote / append_remote_frames /
     parse_remote_temperature_data / merge_channel_readings_to_frames，
-    由调用方（MainWindow）传入 device.datastore.store 模块或测试替身。
+    由调用方（MainWindow）传入 services.datastore.store 模块或测试替身。
     """
 
     # 状态变化（state, message）；供主窗口更新状态栏与远程 Tab
@@ -128,7 +128,7 @@ class RemoteMonitor(QObject):
             client: 已连接的 DataClient（生命周期由调用方管理，监控期间保持连接）
             session_info: 远端会话元数据（含 session_id / started_at / stopped_at）
             device_label: 设备标识 "IP:端口"（用于状态提示与落库来源）
-            store_mod: device.datastore.store 模块（或等价替身）
+            store_mod: services.datastore.store 模块（或等价替身）
             persist_fn: 落库回调 (session, session_info, device_label) -> str
                         （'imported'/'exists'/'failed'/'skipped'）
             message_fn: 可选状态栏消息回调 (text, timeout_ms)

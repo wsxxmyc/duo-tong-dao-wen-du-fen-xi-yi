@@ -117,7 +117,7 @@ class SessionListThread(QThread):
 # ─────────────────────────────────────────────────────────────
 
 def _ip_highlight_color() -> str:
-    """设备列表/弹窗里 IP 高亮绿：深色部件（浅灰工业表）上自动提亮保证可读。"""
+    """设备列表/弹窗里 IP 高亮绿：深色部件（浅灰工业 表）上自动提亮保证可读。"""
     face = Theme.table_face()
     if face:
         return Theme.lighten(Theme.GREEN, 0.55)
@@ -343,7 +343,7 @@ class RemoteDataTab(QWidget):
         selection_bg = Theme.EMPHASIS_FILL
         face = Theme.table_face()
         if face:
-            # 浅灰工业深色部件：会话表整体深底白字，选中行实色深蓝白字；
+            # 浅灰工业 深色部件：会话表整体深底白字，选中行实色深蓝白字；
             # 交替行用深灰两档（同样必须显式给出，理由见上）
             self.setStyleSheet(f"""
                 {Theme.group_box_qss()}
@@ -773,7 +773,7 @@ class RemoteDataTab(QWidget):
         self._last_restyled_row = current_row
         if not self._sessions:
             return
-        # 浅灰工业深色部件时补偿底色换数据表深行底（白字系），其余主题对卡底
+        # 浅灰工业 深色部件时补偿底色换数据表深行底（白字系），其余主题对卡底
         face = Theme.table_face()
         surface = face["base"] if face else None
         fetch_colors = {"ok": Theme.readable_text(Theme.GREEN, surface),

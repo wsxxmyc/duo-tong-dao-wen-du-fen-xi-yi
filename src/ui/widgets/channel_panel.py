@@ -383,6 +383,8 @@ class ChannelPanel(QWidget):
         self._hover_channel_name = None
         self._chart_hover_channel_name = None
         self._locked_channel_name = None
+        # visible_series 取数记忆化缓存（见该方法 docstring，FA-PERF-1）
+        self._vis_cache = {}
         # 视图模式：table=卡表融合行卡（默认）/ classic=经典 70px 大卡；
         # 由 MainWindow 启动加载（channel_view.mode）与设置页切换下发
         self._view_mode = "table"
@@ -685,7 +687,14 @@ class ChannelPanel(QWidget):
             selected_name = str(selected_name).strip() or None
         self._hover_channel_name = selected_name
         self._refresh_card_highlight()
-        if hasattr(self.mw, "refresh_plots"):
+        # 曲线侧优先走 O(通道数) 的原位样式更新（FA-PERF-4）：焦点曾编入
+        # 增量缓存键，悬停每次进出都会整图重建（长会话多通道下肉眼可见
+        # 卡顿）；离线等无增量缓存场景回退整页渲染，保持旧语义
+        renderer = getattr(self.mw, "chart_renderer", None)
+        light = getattr(renderer, "refresh_hover_emphasis", None)
+        if callable(light):
+            light()
+        elif hasattr(self.mw, "refresh_plots"):
             self.mw.refresh_plots()
 
     def clear_hover_temperature(self) -> None:
@@ -843,17 +852,35 @@ class ChannelPanel(QWidget):
         return c.color if c else "#e74c3c"
 
     def visible_series(self, max_minutes=None, only=None):
-        """收集可见通道的 (名称, 分钟x, 温度v)——从 Pipeline 统一管道取数。"""
-        out = []
+        """收集可见通道的 (名称, 分钟x, 温度v)——从 Pipeline 统一管道取数。
+
+        结果按 (会话行数, 参数代, 可见通道名, 窗口) 记忆化（FA-PERF-1）：
+        一次刷新周期内本方法被主绘制 / 近窗判定 / 状态标签 / 悬浮弹窗以
+        相同参数反复调用（每帧 5~6 次，每次 O(n·通道数) 全量分钟换算），
+        记忆化后同一帧只真正取一次。返回列表与内部数组均不被调用方修改
+        （各消费方一律经掩码/重采样产生新数组），可安全共享。
+        """
         s = store.active
         if s is None:
-            return out
+            return []
+        names = tuple(
+            c.display_name for c in s.visible_channels()
+            if only is None or c.display_name == only)
+        key = (s.n, getattr(self.mw.pipeline, "version", 0),
+               max_minutes, only, names)
+        hit = self._vis_cache.get(key)
+        if hit is not None and hit[0] is s:
+            return hit[1]
+        out = []
         for c in s.visible_channels():
             if only is not None and c.display_name != only:
                 continue
             x, v = self.mw.pipeline.series_minutes(s, c, max_minutes)
             if x.size:
                 out.append((c.display_name, x, v))
+        if len(self._vis_cache) >= 3:
+            self._vis_cache.clear()
+        self._vis_cache[key] = (s, out)
         return out
 
     def visible_series_window(self, start_min, end_min):
